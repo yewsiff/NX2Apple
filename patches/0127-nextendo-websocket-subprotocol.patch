@@ -1,0 +1,118 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: yewsifofficial <yewsifofficial@gmail.com>
+Date: Tue, 10 Nov 2026 01:58:16 -0500
+Subject: [PATCH] net: name the WebSocket subprotocol NEX asked for in
+ Nextendo's answer
+
+The traffic log of the first device runs: the game's NEX client sends its
+WebSocket upgrade with "Sec-WebSocket-Protocol: NEX", Nextendo's game
+server answers "101 Switching Protocols" without naming a subprotocol (129
+bytes: status, Upgrade, Connection, Sec-WebSocket-Accept), and the game
+closes the connection at once and reports 2306-0502. WindowSmash's lobby,
+which the game accepts, answers with "Sec-WebSocket-Protocol: NEX". The
+bridge now holds the server's answer head until it is whole and adds the
+subprotocol the game asked for when a 101 answer leaves it out.
+
+A connection Network.framework reports as waiting (no route yet) gets ten
+seconds to become ready instead of being dropped at once: the first login
+of the same run was dropped that way.
+
+Upstream-Status: fork-only (online play is out of nxnative's scope)
+Reason: Nextendo online play for Super Smash Bros. Ultimate
+Issue: TODO
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_017xdHQoEipBX2wTqN8BNnMv
+---
+ dm/host/net_nextendo_apple.m | 51 +++++++++++++++++++++++++++++-------
+ 1 file changed, 41 insertions(+), 10 deletions(-)
+
+diff --git a/dm/host/net_nextendo_apple.m b/dm/host/net_nextendo_apple.m
+index 361d416..bed3022 100644
+--- a/dm/host/net_nextendo_apple.m
++++ b/dm/host/net_nextendo_apple.m
+@@ -593,6 +593,25 @@ static int trust_matches_pin(sec_trust_t trust) {
+     int rhead_done, nframes[2];
+     struct { int have; uint8_t h[14]; uint64_t skip; } ws[2];   // 0: game → server, 1: server → game
+     NSMutableData *cbody[2];  // a close frame's body while it passes
++    NSString *wsproto;        // the WebSocket subprotocol the game's request asks for ("NEX"); the server's answer must name it
++}
++// The WebSocket subprotocol a request head asks for, nil when none
++static NSString *ws_protocol(NSData *head) {
++    NSString *s = [[NSString alloc] initWithData:head encoding:NSISOLatin1StringEncoding];
++    for (NSString *ln in [s componentsSeparatedByString:@"\r\n"])
++        if ([ln.lowercaseString hasPrefix:@"sec-websocket-protocol:"])
++            return [[ln substringFromIndex:23] stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceCharacterSet];
++    return nil;
++}
++// The server's 101 answer, with the subprotocol the game asked for when the server left it out. RFC 6455 lets a server pick none, but
++// the game's NEX client then drops the connection at once (Nextendo's game server answers without it; WindowSmash's lobby, which the
++// game accepts, names NEX). Any other answer passes unchanged
++static NSData *ws_fix_answer(NSData *head, NSString *proto) {
++    NSString *s = [[NSString alloc] initWithData:head encoding:NSISOLatin1StringEncoding];
++    if (!proto.length || ![s hasPrefix:@"HTTP/1.1 101"] || [s.lowercaseString containsString:@"\r\nsec-websocket-protocol:"]) return head;
++    NSString *fixed = [[s substringToIndex:s.length - 2] stringByAppendingFormat:@"Sec-WebSocket-Protocol: %@\r\n\r\n", proto];
++    LOG("[nextendo] bridge: the server's answer names no WebSocket subprotocol: %s added, as the game asked", proto.UTF8String);
++    return [fixed dataUsingEncoding:NSISOLatin1StringEncoding];
+ }
+ // One direction's WebSocket frame headers, read as the bytes pass (payload bytes are skipped, never kept, except a close frame's)
+ - (void)scan:(const uint8_t *)p n:(size_t)n dir:(int)dir {
+@@ -667,6 +686,7 @@ static int trust_matches_pin(sec_trust_t trust) {
+             [rest appendData:[pending subdataWithRange:NSMakeRange(end.location + 4, pending.length - end.location - 4)]];
+             pending = rest; header_done = 1;
+             [self logHead:head who:"game's request"];
++            wsproto = ws_protocol(head);
+             if (pending.length > head.length) [self scan:(const uint8_t *)pending.bytes + head.length n:pending.length - head.length dir:0];
+         }
+         d = nil;
+@@ -693,17 +713,22 @@ static int trust_matches_pin(sec_trust_t trust) {
+                 (void)region; (void)off;
+                 const uint8_t *p = buf;
+                 self->got += size;
+-                if (!self->rhead_done && nx_log_on()) {   // the server's HTTP head, then its frames
++                NSData *held = nil;   // the server's head, once whole, and what came after it in the same read
++                if (!self->rhead_done && (self->wsproto || nx_log_on())) {   // the server's HTTP head: held until whole, fixed, then passed on
+                     if (!self->rhead) self->rhead = [NSMutableData data];
+                     [self->rhead appendBytes:p length:size];
+                     NSRange e2 = [self->rhead rangeOfData:[NSData dataWithBytes:"\r\n\r\n" length:4] options:0 range:NSMakeRange(0, self->rhead.length)];
+-                    if (e2.location != NSNotFound || self->rhead.length > 8192) {
+-                        self->rhead_done = 1;
+-                        NSUInteger hl = e2.location == NSNotFound ? self->rhead.length : e2.location + 4;
+-                        [self logHead:[self->rhead subdataWithRange:NSMakeRange(0, hl)] who:"server's answer"];
+-                        if (self->rhead.length > hl) [self scan:(const uint8_t *)self->rhead.bytes + hl n:self->rhead.length - hl dir:1];
+-                        self->rhead = nil;
+-                    }
++                    if (e2.location == NSNotFound && self->rhead.length <= 8192) return true;   // more of the head to come
++                    self->rhead_done = 1;
++                    NSUInteger hl = e2.location == NSNotFound ? self->rhead.length : e2.location + 4;
++                    NSData *head = [self->rhead subdataWithRange:NSMakeRange(0, hl)];
++                    [self logHead:head who:"server's answer"];
++                    if (e2.location != NSNotFound) head = ws_fix_answer(head, self->wsproto);
++                    NSMutableData *all = [head mutableCopy];
++                    [all appendData:[self->rhead subdataWithRange:NSMakeRange(hl, self->rhead.length - hl)]];
++                    if (self->rhead.length > hl) [self scan:(const uint8_t *)self->rhead.bytes + hl n:self->rhead.length - hl dir:1];
++                    self->rhead = nil;
++                    held = all; p = held.bytes; size = held.length;
+                 } else [self scan:p n:size dir:1];
+                 while (size) {   // the game's end is a local socket: a short wait at most when its buffer is full
+                     ssize_t w = write(self->fd, p, size);
+@@ -772,8 +797,14 @@ static int bridge_open_(const char *sni, int rewrite_host) {
+             s->ready = 1;
+             [s upstream:nil];
+             [s receive];
+-        } else if (st == nw_connection_state_failed || st == nw_connection_state_waiting) {
+-            LOG("[nextendo] cannot reach the game server (%s)", e ? "error" : "waiting");
++        } else if (st == nw_connection_state_waiting) {   // no route yet (the network is coming up, or refused once): it retries by itself
++            NXLOG("bridge: waiting for a route to the game server");
++            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 10 * NSEC_PER_SEC), s->q, ^{
++                NxBridge *s2 = wb;
++                if (s2 && !s2->ready && !s2->closed) { LOG("[nextendo] cannot reach the game server (no route for 10 s)"); [s2 close]; }
++            });
++        } else if (st == nw_connection_state_failed) {
++            LOG("[nextendo] cannot reach the game server (error)");
+             [s close];
+         } else if (st == nw_connection_state_cancelled) {
+             @synchronized (NxBridge.class) { [g_bridges removeObject:s]; }
+-- 
+2.43.0
+

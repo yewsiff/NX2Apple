@@ -11,6 +11,7 @@ call :one nextendo-for-v1.3.0 "if exist dm\host\net_online.h (exit /b 0) else (e
 call :one nextendo-mk8-for-v1.3.0 "findstr /c:nx_is_server dm\host\net_online.h" || exit /b 1
 call :one nextendo-winbuild-for-v1.3.0 "findstr /c:net_nextendo_apple.m dm\host\web_apple.m" || exit /b 1
 call :one nextendo-bridgelog-for-v1.3.0 "findstr /c:logHead dm\host\net_nextendo_apple.m" || exit /b 1
+call :one nextendo-wsfix-for-v1.3.0 "findstr /c:ws_fix_answer dm\host\net_nextendo_apple.m" || exit /b 1
 echo All Nextendo patches are in. Rebuild the game in the launcher.
 exit /b 0
 
