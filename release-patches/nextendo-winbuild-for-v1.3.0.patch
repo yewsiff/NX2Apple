@@ -1,0 +1,40 @@
+diff --git a/dm/host/Makefile b/dm/host/Makefile
+index 56de944..95784e8 100644
+--- a/dm/host/Makefile
++++ b/dm/host/Makefile
+@@ -20,7 +20,7 @@ GAME_H = gen/$(GAME)/game_profile.h
+ include ../mac/min_os.mk
+ CFLAGS=-O1 -g -Wall -Wno-unused-function -mmacosx-version-min=$(MACOS_MIN)
+ # Service-layer takeover hle_*.c files are included by wildcard: adding a file does not touch this line (avoids merge conflicts)
+-SRC=main.c loader.c hle.c crash.c probe.c thread.c save_sync.c memstat.m haptics_apple.m net_nextendo_apple.m $(sort $(wildcard hle_*.c)) front_mac.m controllers_mac.m web_apple.m entry.S
++SRC=main.c loader.c hle.c crash.c probe.c thread.c save_sync.c memstat.m haptics_apple.m $(sort $(wildcard hle_*.c)) front_mac.m controllers_mac.m web_apple.m entry.S
+ # NVN null device + nn::vi + the Vulkan layer (dm/gfx/)
+ # Sources under dm/gfx, dm/gfx/nvn, dm/gfx/tex, dm/gfx/vk and dm/gfx/gl are included by wildcard (tests/ and metal/ do not go into the host): adding a file does not touch this line
+ GFX=$(sort $(wildcard ../gfx/*.c ../gfx/nvn/*.c ../gfx/nvn/*.m ../gfx/nvn/*.S ../gfx/tex/*.c ../gfx/tex/*.m ../gfx/vk/*.m ../gfx/gl/*.m))
+diff --git a/dm/host/net_nextendo_apple.m b/dm/host/net_nextendo_apple.m
+index 834a584..c9a9c0e 100644
+--- a/dm/host/net_nextendo_apple.m
++++ b/dm/host/net_nextendo_apple.m
+@@ -1,3 +1,4 @@
++// Compiled as part of web_apple.m, which includes it (see the end of that file); not a source of its own in the Makefile.
+ // Nextendo Network on Apple platforms (net_online.h): the switches, the account (OAuth 2.0 + PKCE sign-in, the Keychain, the NEX login token),
+ // the ID token, the names, and the TLS bridge that carries the game's NEX WebSocket to Nextendo's game server.
+ //
+diff --git a/dm/host/web_apple.m b/dm/host/web_apple.m
+index ba25f68..f0102ba 100644
+--- a/dm/host/web_apple.m
++++ b/dm/host/web_apple.m
+@@ -409,3 +409,13 @@ void front_web_shot(const char *path) {
+ #endif
+ }
+ void front_web_close(void) { dispatch_async(dispatch_get_main_queue(), ^{ if (g_box) { [g_box close]; g_box = nil; } }); }
++
++// Nextendo online play (net_online.h) is compiled with this file rather than as a source of its own: the Windows app builder
++// (frontend-qt/nspb_qt/win/build_app.py) checks the Makefile's SRC= line word for word and compiles only the files it lists, so a new
++// line there stops every Windows build. These imports are here for that builder's framework scan, which reads the files it compiles
++#import <Network/Network.h>
++#import <Security/Security.h>
++#if TARGET_OS_IPHONE
++#import <AuthenticationServices/AuthenticationServices.h>
++#endif
++#include "net_nextendo_apple.m"
