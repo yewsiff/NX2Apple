@@ -1,0 +1,135 @@
+diff --git a/dm/host/hle_net.c b/dm/host/hle_net.c
+index f59c84f..ccd9a20 100644
+--- a/dm/host/hle_net.c
++++ b/dm/host/hle_net.c
+@@ -215,6 +215,10 @@ enum { SK_AF_INET = 2, SK_SOCK_STREAM = 1, SK_SOCK_DGRAM = 2, SK_NONBLOCK_TYPE =
+        SK_F_GETFL = 3, SK_F_SETFL = 4, SK_SOL_SOCKET = 0xffff, SK_SO_SNDTIMEO = 0x1005, SK_SO_RCVTIMEO = 0x1006, SK_MSG_DONTWAIT = 0x80 };
+ typedef struct { uint8_t len, family; uint16_t port; uint32_t addr; uint8_t zero[8]; } sk_in;   // nn::socket::SockAddrIn, network order
+ static int on_err(int e) { t_skerr = e; return -1; }
++// DM_NEXTENDO_LOG: the game's calls on a bridge socket (the first ones of each kind), to see what it does with the server's answer
++static _Atomic int g_trace_n;
++static int bridge_fd(int fd);
++#define BTRACE(fd, ...) do { if (nx_log_on() && bridge_fd(fd) && atomic_fetch_add(&g_trace_n, 1) < 120) NXLOG(__VA_ARGS__); } while (0)
+ static int on_host(int fd, int *nb, int *type, int64_t *rcv, int64_t *snd) {   // the host socket of a game descriptor, -1 (EBADF) when it is none
+     pthread_mutex_lock(&g_efd_m);
+     int h = sk_used(fd) ? g_efd[fd].host : -1;
+@@ -224,6 +228,7 @@ static int on_host(int fd, int *nb, int *type, int64_t *rcv, int64_t *snd) {   /
+     return h;
+ }
+ // Waits until the host socket has one of events, up to ms (< 0: no bound). 1 ready, 0 timed out, -1 the host is shutting the game down
++static int bridge_fd(int fd) { pthread_mutex_lock(&g_efd_m); int b = sk_used(fd) && g_efd[fd].bridge; pthread_mutex_unlock(&g_efd_m); return b; }
+ static int on_wait(int h, short events, int64_t ms) {
+     uint64_t start = now_ns();
+     for (;;) {
+@@ -259,6 +264,7 @@ static int on_socket(int family, int type, int proto) {
+     return fd;
+ }
+ static int on_close(int fd) {
++    BTRACE(fd, "socket %d: the game closes it", fd);
+     pthread_mutex_lock(&g_efd_m);
+     int h = sk_used(fd) ? g_efd[fd].host : -1;
+     if (h >= 0) { g_efd[fd].used = 0; g_efd[fd].host = -1; }
+@@ -348,6 +354,7 @@ static long on_recv(int fd, void *b, unsigned long len, int flags, void *a, unsi
+     for (;;) {
+         struct sockaddr_in in; socklen_t il = sizeof in;
+         ssize_t r = recvfrom(h, b, len, flags, a ? (struct sockaddr *)&in : NULL, a ? &il : NULL);
++        BTRACE(fd, "socket %d: recv up to %lu (flags %#x%s) -> %ld%s%s", fd, len, flags, nb ? ", non-blocking" : "", (long)r, r < 0 ? ", errno " : "", r < 0 ? strerror(errno) : "");
+         if (r >= 0) {
+             if (a && al) { pthread_mutex_lock(&g_efd_m); int br = sk_used(fd) && g_efd[fd].bridge; pthread_mutex_unlock(&g_efd_m);
+                 if (br || il < sizeof in) { memset(&in, 0, sizeof in); in.sin_addr.s_addr = htonl(NX_BRIDGE_IP); in.sin_port = htons(NX_BRIDGE_PORT); }
+@@ -372,6 +379,7 @@ static long on_send(int fd, const void *b, unsigned long len, int flags, const v
+     }
+     for (;;) {
+         ssize_t r = to ? sendto(h, b, len, flags, (struct sockaddr *)&in, sizeof in) : send(h, b, len, flags);
++        BTRACE(fd, "socket %d: send %lu -> %ld%s%s", fd, len, (long)r, r < 0 ? ", errno " : "", r < 0 ? strerror(errno) : "");
+         if (r >= 0) return r;
+         if (errno != EAGAIN || nb) return on_err(errno);
+         int w = on_wait(h, POLLOUT, snd > 0 ? snd : -1);
+@@ -397,6 +405,7 @@ static int on_name(int fd, void *a, unsigned *n, int peer) {
+ static int on_setsockopt(int fd, int level, int opt, const void *v, unsigned n) {
+     int h = on_host(fd, NULL, NULL, NULL, NULL);
+     if (h < 0) return -1;
++    BTRACE(fd, "socket %d: setsockopt level %#x option %#x (%u bytes)", fd, level, opt, n);
+     if (level == SK_SOL_SOCKET && (opt == SK_SO_RCVTIMEO || opt == SK_SO_SNDTIMEO)) {   // kept here: the host socket never blocks
+         int64_t tv[2] = {0, 0}; if (v) memcpy(tv, v, n < sizeof tv ? n : sizeof tv);
+         int64_t ms = tv[0] * 1000 + tv[1] / 1000;
+@@ -412,12 +421,14 @@ static int on_setsockopt(int fd, int level, int opt, const void *v, unsigned n)
+ static int on_getsockopt(int fd, int level, int opt, void *v, unsigned *n) {
+     int h = on_host(fd, NULL, NULL, NULL, NULL);
+     if (h < 0) return -1;
++    BTRACE(fd, "socket %d: getsockopt level %#x option %#x", fd, level, opt);
+     socklen_t l = n ? *n : 0;
+     if (!getsockopt(h, level == SK_SOL_SOCKET ? SOL_SOCKET : level, opt, v, &l)) { if (n) *n = l; return 0; }
+     return on_err(errno);
+ }
+ static int on_fcntl(int fd, int cmd, int val) {
+     if (on_host(fd, NULL, NULL, NULL, NULL) < 0) return -1;
++    BTRACE(fd, "socket %d: fcntl %d %#x", fd, cmd, val);
+     pthread_mutex_lock(&g_efd_m);
+     int r = 0;
+     if (cmd == SK_F_GETFL) r = 2 | (g_efd[fd].nonblock ? SK_O_NONBLOCK : 0);   // O_RDWR
+@@ -466,6 +477,7 @@ static int on_poll(sk_pollfd *p, uint64_t n, int ms) {
+         if (ready || (ms >= 0 && left <= 0)) break;
+         if (dm_teardown_is_parking()) { dm_teardown_check_current_thread(); break; }
+     }
++    for (uint64_t i = 0; i < n; i++) if (p[i].fd >= 0 && p[i].revents) BTRACE(p[i].fd, "socket %d: poll events %#x -> revents %#x (%d ms)", p[i].fd, p[i].events, p[i].revents, ms);
+     if (hp != small) free(hp);
+     return ready;
+ }
+diff --git a/dm/host/net_nextendo_apple.m b/dm/host/net_nextendo_apple.m
+index bed3022..d853ef1 100644
+--- a/dm/host/net_nextendo_apple.m
++++ b/dm/host/net_nextendo_apple.m
+@@ -594,6 +594,35 @@ static int trust_matches_pin(sec_trust_t trust) {
+     struct { int have; uint8_t h[14]; uint64_t skip; } ws[2];   // 0: game → server, 1: server → game
+     NSMutableData *cbody[2];  // a close frame's body while it passes
+     NSString *wsproto;        // the WebSocket subprotocol the game's request asks for ("NEX"); the server's answer must name it
++    NSString *wskey;          // the request's Sec-WebSocket-Key: the answer's Sec-WebSocket-Accept is checked against it
++}
++static NSString *head_value(NSData *head, NSString *name) {   // a header's value (name in lower case), nil when absent
++    NSString *s = [[NSString alloc] initWithData:head encoding:NSISOLatin1StringEncoding];
++    NSString *want = [name stringByAppendingString:@":"];
++    for (NSString *ln in [s componentsSeparatedByString:@"\r\n"])
++        if ([ln.lowercaseString hasPrefix:want])
++            return [[ln substringFromIndex:want.length] stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceCharacterSet];
++    return nil;
++}
++// RFC 6455: base64(SHA-1(key + the fixed GUID)), what a client checks the server's Sec-WebSocket-Accept against
++static NSString *ws_accept_for(NSString *key) {
++    NSData *in = [[key stringByAppendingString:@"258EAFA5-E914-47DA-95CA-C5AB0DC85B11"] dataUsingEncoding:NSUTF8StringEncoding];
++    uint8_t h[CC_SHA1_DIGEST_LENGTH];
++    CC_SHA1(in.bytes, (CC_LONG)in.length, h);
++    return [[NSData dataWithBytes:h length:sizeof h] base64EncodedStringWithOptions:0];
++}
++// The answer's Sec-WebSocket-Accept, checked against the request's key; a wrong one is logged and corrected (the game drops the connection on it)
++static NSData *ws_fix_accept(NSData *head, NSString *key) {
++    NSString *got = head_value(head, @"sec-websocket-accept");
++    if (!key.length || !got) return head;
++    NSString *want = ws_accept_for(key);
++    if ([got isEqualToString:want]) { NXLOG("bridge: the server's Sec-WebSocket-Accept is right for the game's key"); return head; }
++    LOG("[nextendo] bridge: the server's Sec-WebSocket-Accept is wrong for the game's key: corrected");
++    NSString *s = [[NSString alloc] initWithData:head encoding:NSISOLatin1StringEncoding];
++    NSMutableArray *lines = [[s componentsSeparatedByString:@"\r\n"] mutableCopy];
++    for (NSUInteger i = 0; i < lines.count; i++)
++        if ([[lines[i] lowercaseString] hasPrefix:@"sec-websocket-accept:"]) lines[i] = [@"Sec-WebSocket-Accept: " stringByAppendingString:want];
++    return [[lines componentsJoinedByString:@"\r\n"] dataUsingEncoding:NSISOLatin1StringEncoding];
+ }
+ // The WebSocket subprotocol a request head asks for, nil when none
+ static NSString *ws_protocol(NSData *head) {
+@@ -687,6 +716,7 @@ static NSData *ws_fix_answer(NSData *head, NSString *proto) {
+             pending = rest; header_done = 1;
+             [self logHead:head who:"game's request"];
+             wsproto = ws_protocol(head);
++            wskey = head_value(head, @"sec-websocket-key");
+             if (pending.length > head.length) [self scan:(const uint8_t *)pending.bytes + head.length n:pending.length - head.length dir:0];
+         }
+         d = nil;
+@@ -723,7 +753,7 @@ static NSData *ws_fix_answer(NSData *head, NSString *proto) {
+                     NSUInteger hl = e2.location == NSNotFound ? self->rhead.length : e2.location + 4;
+                     NSData *head = [self->rhead subdataWithRange:NSMakeRange(0, hl)];
+                     [self logHead:head who:"server's answer"];
+-                    if (e2.location != NSNotFound) head = ws_fix_answer(head, self->wsproto);
++                    if (e2.location != NSNotFound) head = ws_fix_accept(ws_fix_answer(head, self->wsproto), self->wskey);
+                     NSMutableData *all = [head mutableCopy];
+                     [all appendData:[self->rhead subdataWithRange:NSMakeRange(hl, self->rhead.length - hl)]];
+                     if (self->rhead.length > hl) [self scan:(const uint8_t *)self->rhead.bytes + hl n:self->rhead.length - hl dir:1];
