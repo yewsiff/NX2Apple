@@ -9,7 +9,7 @@ if not exist dm\host\hle_net.c (
 set BASE=https://raw.githubusercontent.com/yewsiff/NX2Apple/nextendo-online/release-patches
 rem Each line: the patch, and a marker that is already in the files when that patch is in.
 rem Markers are single tokens on purpose: quotes and parentheses inside the argument break cmd parsing.
-call :one nextendo-for-v1.3.0 net_online.h dm\host\net_online.h || exit /b 1
+call :one nextendo-for-v1.3.0 NX_CLIENT_ID_DEFAULT dm\host\net_online.h || exit /b 1
 call :one nextendo-mk8-for-v1.3.0 nx_is_server dm\host\net_online.h || exit /b 1
 call :one nextendo-winbuild-for-v1.3.0 net_nextendo_apple.m dm\host\web_apple.m || exit /b 1
 call :one nextendo-bridgelog-for-v1.3.0 logHead dm\host\net_nextendo_apple.m || exit /b 1
@@ -17,7 +17,7 @@ call :one nextendo-wsfix-for-v1.3.0 ws_fix_answer dm\host\net_nextendo_apple.m |
 call :one nextendo-trace-for-v1.3.0 ws_fix_accept dm\host\net_nextendo_apple.m || exit /b 1
 call :one nextendo-fd3-for-v1.3.0 SK_FD_FIRST dm\host\hle_net.c || exit /b 1
 call :one nextendo-errno-for-v1.3.0 sk_err_linux dm\host\hle_net.c || exit /b 1
-call :one nextendo-secure-for-v1.3.0 nx_is_server dm\host\hle_net.c || exit /b 1
+call :one nextendo-secure-for-v1.3.0 uint16_t dm\host\net_online.h || exit /b 1
 call :one nextendo-udp-for-v1.3.0 park_take dm\host\hle_net.c || exit /b 1
 echo.
 echo All Nextendo patches are in. Rebuild the game in the launcher.
