@@ -1,0 +1,26 @@
+diff --git a/dm/host/hle_net.c b/dm/host/hle_net.c
+index ccd9a20..5441060 100644
+--- a/dm/host/hle_net.c
++++ b/dm/host/hle_net.c
+@@ -213,7 +213,8 @@ int dm_sk_select(int nfds, uint64_t *r, uint64_t *w, uint64_t *e, const int64_t
+ // in slices, giving up the guest core meanwhile (hle_thread.c), on sockets the host keeps non-blocking.
+ enum { SK_AF_INET = 2, SK_SOCK_STREAM = 1, SK_SOCK_DGRAM = 2, SK_NONBLOCK_TYPE = 0x20000000, SK_O_NONBLOCK = 4, SK_O_NONBLOCK_ALT = 0x800,
+        SK_F_GETFL = 3, SK_F_SETFL = 4, SK_SOL_SOCKET = 0xffff, SK_SO_SNDTIMEO = 0x1005, SK_SO_RCVTIMEO = 0x1006, SK_MSG_DONTWAIT = 0x80 };
+-typedef struct { uint8_t len, family; uint16_t port; uint32_t addr; uint8_t zero[8]; } sk_in;   // nn::socket::SockAddrIn, network order
++typedef struct { uint8_t len, family; uint16_t port; uint32_t addr; uint8_t zero[8]; } sk_in;
++enum { SK_FD_FIRST = 3 };   // the first socket descriptor (see on_socket)   // nn::socket::SockAddrIn, network order
+ static int on_err(int e) { t_skerr = e; return -1; }
+ // DM_NEXTENDO_LOG: the game's calls on a bridge socket (the first ones of each kind), to see what it does with the server's answer
+ static _Atomic int g_trace_n;
+@@ -252,7 +253,10 @@ static int on_socket(int family, int type, int proto) {
+     int one = 1; setsockopt(h, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof one);
+     pthread_mutex_lock(&g_efd_m);
+     int fd = -1;
+-    for (int i = 0; i < EFD_MAX && fd < 0; i++) if (!g_efd[i].used) fd = i;
++    // Sockets are numbered from 3, never 0-2: Smash's NEX client wrote its request on socket 0, was told the answer was ready, and never read
++    // it (most likely it takes a descriptor of 0 as "no socket" when it dispatches readiness); WindowSmash numbers its sockets from 3 and the same client
++    // reads there. Event descriptors keep the numbers from 0 that offline games rely on
++    for (int i = SK_FD_FIRST; i < EFD_MAX && fd < 0; i++) if (!g_efd[i].used) fd = i;
+     if (fd >= 0) {
+         memset(&g_efd[fd], 0, sizeof g_efd[fd]);
+         g_efd[fd].used = 1; g_efd[fd].host = h; g_efd[fd].pr = g_efd[fd].pw = -1; g_efd[fd].type = type; g_efd[fd].nonblock = nb;

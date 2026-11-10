@@ -13,6 +13,7 @@ call :one nextendo-winbuild-for-v1.3.0 "findstr /c:net_nextendo_apple.m dm\host\
 call :one nextendo-bridgelog-for-v1.3.0 "findstr /c:logHead dm\host\net_nextendo_apple.m" || exit /b 1
 call :one nextendo-wsfix-for-v1.3.0 "findstr /c:ws_fix_answer dm\host\net_nextendo_apple.m" || exit /b 1
 call :one nextendo-trace-for-v1.3.0 "findstr /c:ws_fix_accept dm\host\net_nextendo_apple.m" || exit /b 1
+call :one nextendo-fd3-for-v1.3.0 "findstr /c:SK_FD_FIRST dm\host\hle_net.c" || exit /b 1
 echo All Nextendo patches are in. Rebuild the game in the launcher.
 exit /b 0
 
