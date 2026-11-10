@@ -1,0 +1,109 @@
+diff --git a/dm/host/net_nextendo_apple.m b/dm/host/net_nextendo_apple.m
+index c9a9c0e..361d416 100644
+--- a/dm/host/net_nextendo_apple.m
++++ b/dm/host/net_nextendo_apple.m
+@@ -586,10 +586,63 @@ static int trust_matches_pin(sec_trust_t trust) {
+     NSMutableData *pending;   // what the game sent before the connection was ready, or the first request while its header is incomplete
+     NSString *sni;            // the server name asked for, and the first request's Host when the header is rewritten
+     int ready, closed, header_done;
++    // DM_NEXTENDO_LOG: what crosses the bridge, without the payloads (the login carries the account's token): the HTTP heads, then each
++    // WebSocket frame's opcode and length per direction, a close frame's code and reason, and the byte counts at the end
++    uint64_t sent, got;
++    NSMutableData *rhead;     // the server's HTTP head until its blank line
++    int rhead_done, nframes[2];
++    struct { int have; uint8_t h[14]; uint64_t skip; } ws[2];   // 0: game → server, 1: server → game
++    NSMutableData *cbody[2];  // a close frame's body while it passes
++}
++// One direction's WebSocket frame headers, read as the bytes pass (payload bytes are skipped, never kept, except a close frame's)
++- (void)scan:(const uint8_t *)p n:(size_t)n dir:(int)dir {
++    if (!nx_log_on()) return;
++    typeof(ws[0]) *w = &ws[dir];
++    NSMutableData *__strong *cb = &cbody[dir];
++    while (n) {
++        if (w->skip) {
++            size_t k = (size_t)(w->skip < n ? w->skip : n);
++            if (*cb && (*cb).length < 125) [*cb appendBytes:p length:MIN(k, 125 - (*cb).length)];
++            p += k; n -= k; w->skip -= k;
++            if (!w->skip && *cb) {
++                const uint8_t *b = (*cb).bytes; NSUInteger bl = (*cb).length;
++                int code = bl >= 2 && dir == 1 ? b[0] << 8 | b[1] : -1;
++                NSString *why = bl > 2 && dir == 1 ? [[NSString alloc] initWithBytes:b + 2 length:bl - 2 encoding:NSUTF8StringEncoding] : nil;
++                LOG("[nextendo] bridge: %s sends a WebSocket close (code %d%s%s)", dir ? "the server" : "the game", code, why.length ? ", " : "", why.UTF8String ?: "");
++                *cb = nil;
++            }
++            continue;
++        }
++        w->h[w->have++] = *p++; n--;
++        if (w->have < 2) continue;
++        int masked = w->h[1] >> 7, l7 = w->h[1] & 0x7f, need = 2 + (l7 == 126 ? 2 : l7 == 127 ? 8 : 0) + (masked ? 4 : 0);
++        if (w->have < need) continue;
++        uint64_t len = l7;
++        if (l7 == 126) len = (uint64_t)w->h[2] << 8 | w->h[3];
++        else if (l7 == 127) { len = 0; for (int i = 0; i < 8; i++) len = len << 8 | w->h[2 + i]; }
++        int op = w->h[0] & 0x0f;
++        if (nframes[dir]++ < 12 || op == 8) NXLOG("bridge: %s frame opcode %d, %llu bytes", dir ? "server → game" : "game → server", op, (unsigned long long)len);
++        *cb = op == 8 && dir == 1 ? [NSMutableData data] : nil;
++        if (op == 8 && dir == 0) NXLOG("bridge: the game sends a WebSocket close");
++        w->skip = len; w->have = 0;
++        if (!len && *cb) { LOG("[nextendo] bridge: the server sends a WebSocket close (no code)"); *cb = nil; }
++    }
++}
++- (void)logHead:(NSData *)head who:(const char *)who {   // the request or status line and the header names (values only of the harmless ones)
++    if (!nx_log_on()) return;
++    NSString *s = [[NSString alloc] initWithData:head encoding:NSISOLatin1StringEncoding];
++    for (NSString *ln in [s componentsSeparatedByString:@"\r\n"]) {
++        if (!ln.length) continue;
++        NSRange c = [ln rangeOfString:@":"];
++        NSString *k = c.location == NSNotFound ? nil : [ln substringToIndex:c.location].lowercaseString;
++        BOOL show = !k || [@[@"host", @"upgrade", @"connection", @"sec-websocket-protocol", @"sec-websocket-version", @"server", @"content-type", @"content-length"] containsObject:k];
++        LOG("[nextendo] bridge: %s: %s", who, (show ? ln : [k stringByAppendingString:@": …"]).UTF8String);
++    }
+ }
+ - (void)close {
+     if (closed) return;
+     closed = 1;
++    NXLOG("bridge: closed after %llu bytes to the server and %llu from it", (unsigned long long)sent, (unsigned long long)got);
+     if (rd) { dispatch_source_cancel(rd); rd = nil; } else if (fd >= 0) close(fd);
+     if (conn) nw_connection_cancel(conn);
+     conn = nil;
+@@ -613,13 +666,19 @@ static int trust_matches_pin(sec_trust_t trust) {
+             NSMutableData *rest = [head mutableCopy];
+             [rest appendData:[pending subdataWithRange:NSMakeRange(end.location + 4, pending.length - end.location - 4)]];
+             pending = rest; header_done = 1;
++            [self logHead:head who:"game's request"];
++            if (pending.length > head.length) [self scan:(const uint8_t *)pending.bytes + head.length n:pending.length - head.length dir:0];
+         }
+         d = nil;
+-    } else if (!ready) { if (d) [pending appendData:d]; return; }
++    } else {
++        if (d) [self scan:d.bytes n:d.length dir:0];
++        if (!ready) { if (d) [pending appendData:d]; return; }
++    }
+     if (!ready) return;
+     NSData *out = d;
+     if (pending.length) { NSMutableData *m = pending; if (d) [m appendData:d]; out = m; pending = [NSMutableData data]; }
+     if (!out.length) return;
++    sent += out.length;
+     dispatch_data_t dd = dispatch_data_create(out.bytes, out.length, q, DISPATCH_DATA_DESTRUCTOR_DEFAULT);
+     nw_connection_send(conn, dd, NW_CONNECTION_DEFAULT_MESSAGE_CONTEXT, true, ^(nw_error_t e) { if (e) { NXLOG("bridge: send failed"); [self close]; } });
+ }
+@@ -633,6 +692,19 @@ static int trust_matches_pin(sec_trust_t trust) {
+             dispatch_data_apply(content, ^bool(dispatch_data_t region, size_t off, const void *buf, size_t size) {
+                 (void)region; (void)off;
+                 const uint8_t *p = buf;
++                self->got += size;
++                if (!self->rhead_done && nx_log_on()) {   // the server's HTTP head, then its frames
++                    if (!self->rhead) self->rhead = [NSMutableData data];
++                    [self->rhead appendBytes:p length:size];
++                    NSRange e2 = [self->rhead rangeOfData:[NSData dataWithBytes:"\r\n\r\n" length:4] options:0 range:NSMakeRange(0, self->rhead.length)];
++                    if (e2.location != NSNotFound || self->rhead.length > 8192) {
++                        self->rhead_done = 1;
++                        NSUInteger hl = e2.location == NSNotFound ? self->rhead.length : e2.location + 4;
++                        [self logHead:[self->rhead subdataWithRange:NSMakeRange(0, hl)] who:"server's answer"];
++                        if (self->rhead.length > hl) [self scan:(const uint8_t *)self->rhead.bytes + hl n:self->rhead.length - hl dir:1];
++                        self->rhead = nil;
++                    }
++                } else [self scan:p n:size dir:1];
+                 while (size) {   // the game's end is a local socket: a short wait at most when its buffer is full
+                     ssize_t w = write(self->fd, p, size);
+                     if (w > 0) { p += w; size -= (size_t)w; continue; }
