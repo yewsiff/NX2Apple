@@ -1,0 +1,143 @@
+diff --git a/dm/host/hle_net.c b/dm/host/hle_net.c
+index e7a12ab..7f61473 100644
+--- a/dm/host/hle_net.c
++++ b/dm/host/hle_net.c
+@@ -72,7 +72,7 @@ enum { EFD_MAX = 64, SK_POLLIN = 1, SK_POLLOUT = 4, SK_POLLRDNORM = 0x40, SK_POL
+ // One table for every descriptor the host hands out, so their numbers never clash: an event descriptor (host < 0), or online a socket (host is the
+ // host's own socket, always non-blocking at the host; nonblock is the game's own setting). Online, an event descriptor also has a pipe that holds
+ // one byte while its count is not zero (pr / pw), so a host poll can wait on it beside the sockets
+-static struct { uint64_t count; int used, flags; int host, pr, pw, type, nonblock, bridge; int64_t rcv_ms, snd_ms; } g_efd[EFD_MAX];
++static struct { uint64_t count; int used, flags; int host, pr, pw, type, nonblock, bridge, bport; int64_t rcv_ms, snd_ms; } g_efd[EFD_MAX];
+ static pthread_mutex_t g_efd_m = PTHREAD_MUTEX_INITIALIZER;
+ static pthread_cond_t g_efd_c = PTHREAD_COND_INITIALIZER;
+ static int efd_used(int fd) { return fd >= 0 && fd < EFD_MAX && g_efd[fd].used && g_efd[fd].host < 0; }   // with g_efd_m held: an event descriptor
+@@ -241,7 +241,33 @@ static int on_err(int e) { t_skerr = sk_err_linux(e); return -1; }
+ // DM_NEXTENDO_LOG: the game's calls on a bridge socket (the first ones of each kind), to see what it does with the server's answer
+ static _Atomic int g_trace_n;
+ static int bridge_fd(int fd);
+-#define BTRACE(fd, ...) do { if (nx_log_on() && bridge_fd(fd) && atomic_fetch_add(&g_trace_n, 1) < 120) NXLOG(__VA_ARGS__); } while (0)
++#define BTRACE(fd, ...) do { if (nx_log_on() && atomic_fetch_add(&g_trace_n, 1) < 240) NXLOG(__VA_ARGS__); } while (0)
++static const char *ip_str(uint32_t ip_net, uint16_t port_net, char out[24]) {   // "a.b.c.d:p" (network order in)
++    uint32_t a = ntohl(ip_net);
++    snprintf(out, 24, "%u.%u.%u.%u:%u", a >> 24, a >> 16 & 255, a >> 8 & 255, a & 255, ntohs(port_net));
++    return out;
++}
++// A UDP port the game bound and closed is parked: the host socket stays open under that port for a few seconds, and binding the
++// same port again gets it back. Pia probes the NAT check, closes the socket, and binds the same port again ~100 ms later; the
++// NAT mapping of the host port has to survive that, or the check sees two different mappings and fails (sm35recomp, bsd_host.c)
++#define PARK_MAX 16
++#define PARK_NS (10ull * 1000000000ull)
++static struct { int h; uint16_t port; uint64_t until; } g_park[PARK_MAX];   // h < 0: empty (under g_efd_m)
++static void park_prune(uint64_t now) {   // with g_efd_m held
++    for (int i = 0; i < PARK_MAX; i++) if (g_park[i].h >= 0 && g_park[i].until <= now) { close(g_park[i].h); g_park[i].h = -1; }
++}
++static int park_take(uint16_t port) {   // with g_efd_m held: the parked host socket of port, -1 when none
++    park_prune(now_ns());
++    for (int i = 0; i < PARK_MAX; i++) if (g_park[i].h >= 0 && g_park[i].port == port) { int h = g_park[i].h; g_park[i].h = -1; return h; }
++    return -1;
++}
++static int park_put(int h, uint16_t port) {   // with g_efd_m held: 1 when parked (h is the table's now)
++    uint64_t now = now_ns();
++    park_prune(now);
++    for (int i = 0; i < PARK_MAX; i++) if (g_park[i].h < 0) { g_park[i] = (typeof(g_park[0])){h, port, now + PARK_NS}; return 1; }
++    return 0;
++}
++__attribute__((constructor)) static void park_init(void) { for (int i = 0; i < PARK_MAX; i++) g_park[i].h = -1; }
+ static int on_host(int fd, int *nb, int *type, int64_t *rcv, int64_t *snd) {   // the host socket of a game descriptor, -1 (EBADF) when it is none
+     pthread_mutex_lock(&g_efd_m);
+     int h = sk_used(fd) ? g_efd[fd].host : -1;
+@@ -293,11 +319,15 @@ static int on_close(int fd) {
+     BTRACE(fd, "socket %d: the game closes it", fd);
+     pthread_mutex_lock(&g_efd_m);
+     int h = sk_used(fd) ? g_efd[fd].host : -1;
+-    if (h >= 0) { g_efd[fd].used = 0; g_efd[fd].host = -1; }
++    int parked = 0, port = h >= 0 ? g_efd[fd].bport : 0;
++    if (h >= 0) {
++        if (g_efd[fd].type == SK_SOCK_DGRAM && port) parked = park_put(h, (uint16_t)port);
++        g_efd[fd].used = 0; g_efd[fd].host = -1;
++    }
+     pthread_mutex_unlock(&g_efd_m);
+     if (h < 0) return efd_close(fd);
+-    close(h);
+-    NXLOG("socket %d: closed", fd);
++    if (!parked) close(h);
++    NXLOG("socket %d: closed%s", fd, parked ? " (its UDP port stays parked for a rebind)" : "");
+     return 0;
+ }
+ static int in_of(const void *a, unsigned n, struct sockaddr_in *out) {   // the game's address as the host's
+@@ -347,12 +377,33 @@ static int on_bind(int fd, const void *a, unsigned n) {
+     if (h < 0) return -1;
+     struct sockaddr_in in;
+     if (!in_of(a, n, &in)) return on_err(EAFNOSUPPORT);
+-    if (!bind(h, (struct sockaddr *)&in, sizeof in)) return 0;
+-    if (errno == EADDRNOTAVAIL && in.sin_addr.s_addr) {   // an address the game took from nifm that the host's interfaces no longer have: any of them
++    char d[24];
++    int type = 0;
++    pthread_mutex_lock(&g_efd_m);
++    if (sk_used(fd)) type = g_efd[fd].type;
++    int ph = type == SK_SOCK_DGRAM && in.sin_port ? park_take(ntohs(in.sin_port)) : -1;
++    pthread_mutex_unlock(&g_efd_m);
++    if (ph >= 0) {   // the same UDP port again: the parked socket, with its NAT mapping, takes this one's place
++        dup2(ph, h);
++        close(ph);
++        fcntl(h, F_SETFL, fcntl(h, F_GETFL) | O_NONBLOCK);
++        pthread_mutex_lock(&g_efd_m);
++        if (sk_used(fd)) g_efd[fd].bport = ntohs(in.sin_port);
++        pthread_mutex_unlock(&g_efd_m);
++        BTRACE(fd, "socket %d: bind %s -> the parked socket of that port", fd, ip_str(in.sin_addr.s_addr, in.sin_port, d));
++        return 0;
++    }
++    int r = bind(h, (struct sockaddr *)&in, sizeof in);
++    if (r && errno == EADDRNOTAVAIL && in.sin_addr.s_addr) {   // an address the game took from nifm that the host's interfaces no longer have: any of them
+         in.sin_addr.s_addr = 0;
+-        if (!bind(h, (struct sockaddr *)&in, sizeof in)) return 0;
++        r = bind(h, (struct sockaddr *)&in, sizeof in);
+     }
+-    return on_err(errno);
++    BTRACE(fd, "socket %d: bind %s -> %d%s%s", fd, ip_str(in.sin_addr.s_addr, in.sin_port, d), r, r ? ", errno " : "", r ? strerror(errno) : "");
++    if (r) return on_err(errno);
++    pthread_mutex_lock(&g_efd_m);
++    if (sk_used(fd)) g_efd[fd].bport = ntohs(in.sin_port);
++    pthread_mutex_unlock(&g_efd_m);
++    return 0;
+ }
+ static int on_listen(int fd, int backlog) { int h = on_host(fd, NULL, NULL, NULL, NULL); return h < 0 ? -1 : listen(h, backlog) ? on_err(errno) : 0; }
+ static int on_accept(int fd, void *a, unsigned *n) {
+@@ -383,7 +434,8 @@ static long on_recv(int fd, void *b, unsigned long len, int flags, void *a, unsi
+     for (;;) {
+         struct sockaddr_in in; socklen_t il = sizeof in;
+         ssize_t r = recvfrom(h, b, len, flags, a ? (struct sockaddr *)&in : NULL, a ? &il : NULL);
+-        BTRACE(fd, "socket %d: recv up to %lu (flags %#x%s) -> %ld%s%s", fd, len, flags, nb ? ", non-blocking" : "", (long)r, r < 0 ? ", errno " : "", r < 0 ? strerror(errno) : "");
++        if (r >= 0 && a && type == SK_SOCK_DGRAM) { char d[24]; BTRACE(fd, "socket %d: recvfrom -> %ld from %s", fd, (long)r, ip_str(in.sin_addr.s_addr, in.sin_port, d)); }
++        else BTRACE(fd, "socket %d: recv up to %lu (flags %#x%s) -> %ld%s%s", fd, len, flags, nb ? ", non-blocking" : "", (long)r, r < 0 ? ", errno " : "", r < 0 ? strerror(errno) : "");
+         if (r >= 0) {
+             if (a && al) { pthread_mutex_lock(&g_efd_m); int br = sk_used(fd) && g_efd[fd].bridge; pthread_mutex_unlock(&g_efd_m);
+                 if (br || il < sizeof in) { memset(&in, 0, sizeof in); in.sin_addr.s_addr = htonl(NX_BRIDGE_IP); in.sin_port = htons(NX_BRIDGE_PORT); }
+@@ -408,7 +460,8 @@ static long on_send(int fd, const void *b, unsigned long len, int flags, const v
+     }
+     for (;;) {
+         ssize_t r = to ? sendto(h, b, len, flags, (struct sockaddr *)&in, sizeof in) : send(h, b, len, flags);
+-        BTRACE(fd, "socket %d: send %lu -> %ld%s%s", fd, len, (long)r, r < 0 ? ", errno " : "", r < 0 ? strerror(errno) : "");
++        if (to) { char d[24]; BTRACE(fd, "socket %d: sendto %lu -> %ld, %s%s%s", fd, len, (long)r, ip_str(in.sin_addr.s_addr, in.sin_port, d), r < 0 ? ", errno " : "", r < 0 ? strerror(errno) : ""); }
++        else BTRACE(fd, "socket %d: send %lu -> %ld%s%s", fd, len, (long)r, r < 0 ? ", errno " : "", r < 0 ? strerror(errno) : "");
+         if (r >= 0) return r;
+         if (errno != EAGAIN || nb) return on_err(errno);
+         int w = on_wait(h, POLLOUT, snd > 0 ? snd : -1);
+diff --git a/dm/host/net_nextendo_apple.m b/dm/host/net_nextendo_apple.m
+index 9aa99eb..43f54dc 100644
+--- a/dm/host/net_nextendo_apple.m
++++ b/dm/host/net_nextendo_apple.m
+@@ -135,7 +135,12 @@ int nx_resolve(const char *name, uint32_t *ip) {
+         NXLOG("name %s -> %s", n, *ip == C.nat ? "the NAT check" : "the game server");
+         return 1;
+     }
+-    NXLOG("name %s: not resolved (only Nintendo's names are, online)", n);
++    char shown[64];   // the name as given, non-printable bytes escaped: a garbled name is a finding of its own
++    size_t si = 0;
++    for (const char *p2 = name; *p2 && si < sizeof shown - 5; p2++)
++        si += (size_t)(*p2 >= 32 && *p2 < 127 ? (shown[si] = *p2, 1) : snprintf(shown + si, 5, "\\x%02x", (unsigned char)*p2));
++    shown[si] = 0;
++    NXLOG("name %s (%zu bytes): not resolved (only Nintendo's names are, online)", shown, strlen(name));
+     return 0;
+ }
+ int nx_is_server(uint32_t ip) { return dm_net_online() && ip == C.server; }

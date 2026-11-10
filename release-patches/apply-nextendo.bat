@@ -18,6 +18,7 @@ call :one nextendo-trace-for-v1.3.0 ws_fix_accept dm\host\net_nextendo_apple.m |
 call :one nextendo-fd3-for-v1.3.0 SK_FD_FIRST dm\host\hle_net.c || exit /b 1
 call :one nextendo-errno-for-v1.3.0 sk_err_linux dm\host\hle_net.c || exit /b 1
 call :one nextendo-secure-for-v1.3.0 nx_is_server dm\host\hle_net.c || exit /b 1
+call :one nextendo-udp-for-v1.3.0 park_take dm\host\hle_net.c || exit /b 1
 echo.
 echo All Nextendo patches are in. Rebuild the game in the launcher.
 exit /b 0
