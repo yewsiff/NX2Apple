@@ -1,0 +1,91 @@
+diff --git a/dm/host/hle_net.c b/dm/host/hle_net.c
+index 85c9d42..e7a12ab 100644
+--- a/dm/host/hle_net.c
++++ b/dm/host/hle_net.c
+@@ -321,8 +321,11 @@ static int on_connect(int fd, const void *a, unsigned n) {
+     if (!in_of(a, n, &in)) return on_err(EAFNOSUPPORT);
+     uint32_t ip = ntohl(in.sin_addr.s_addr);
+     if (!nx_dest_allowed(ip, type == SK_SOCK_DGRAM)) { NXLOG("socket %d: connect to %08x refused (not a Nextendo server)", fd, ip); return on_err(ECONNREFUSED); }
+-    if (type == SK_SOCK_STREAM && ip == NX_BRIDGE_IP) {   // the game's NEX login: the bridge takes this descriptor's place
+-        int b = nx_bridge_open(NULL, 1);
++    // Every TCP connection to Nextendo goes out in TLS, the server's key pinned: the stand-in address (the NEX login the observation gate
++    // points there) and the game server itself (the secure connection after the login, whose station URL names the server's host and its own
++    // port; the game dials it in clear, as its login went). The bridge takes the descriptor's place either way
++    if (type == SK_SOCK_STREAM && (ip == NX_BRIDGE_IP || nx_is_server(ip))) {
++        int b = nx_bridge_open(NULL, 1, ip == NX_BRIDGE_IP ? 0 : ntohs(in.sin_port));
+         if (b < 0) return on_err(ECONNREFUSED);
+         if (dup2(b, h) < 0) { int e = errno; close(b); return on_err(e); }
+         close(b);
+@@ -669,7 +672,7 @@ static Result on_ssl_handshake(on_ssl *c) {
+         NXLOG("ssl: handshake on socket %d refused: not connected to the game server", c->fd);
+         return c->last = RES_FAIL;
+     }
+-    int b = nx_bridge_open(c->host, 0);
++    int b = nx_bridge_open(c->host, 0, ntohs(in.sin_port));   // TLS to the port the game connected to
+     if (b < 0) return c->last = RES_FAIL;
+     if (dup2(b, h) < 0) { close(b); return c->last = RES_FAIL; }
+     close(b);
+diff --git a/dm/host/net_nextendo_apple.m b/dm/host/net_nextendo_apple.m
+index d853ef1..9aa99eb 100644
+--- a/dm/host/net_nextendo_apple.m
++++ b/dm/host/net_nextendo_apple.m
+@@ -778,15 +778,15 @@ static NSData *ws_fix_answer(NSData *head, NSString *proto) {
+ 
+ static NSMutableSet *g_bridges;   // keeps each bridge alive until it closes (on its own queue)
+ 
+-static int bridge_open_(const char *sni, int rewrite_host);
+-int nx_bridge_open(const char *sni, int rewrite_host) {
++static int bridge_open_(const char *sni, int rewrite_host, uint16_t port);
++int nx_bridge_open(const char *sni, int rewrite_host, uint16_t port) {
+     if (!dm_net_online()) { errno = ENETDOWN; return -1; }
+     __block int fd = -1, err = 0;
+-    on_host_thread(^{ fd = bridge_open_(sni, rewrite_host); err = errno; });
++    on_host_thread(^{ fd = bridge_open_(sni, rewrite_host, port); err = errno; });
+     if (fd < 0) errno = err;
+     return fd;
+ }
+-static int bridge_open_(const char *sni, int rewrite_host) {
++static int bridge_open_(const char *sni, int rewrite_host, uint16_t port) {
+     int sv[2];
+     if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv)) return -1;
+     int nos = 1;
+@@ -803,8 +803,8 @@ static int bridge_open_(const char *sni, int rewrite_host) {
+     char ip[16];
+     struct in_addr ia = {htonl(C.server)};
+     inet_ntop(AF_INET, &ia, ip, sizeof ip);
+-    char port[8]; snprintf(port, sizeof port, "%u", C.server_port);
+-    nw_endpoint_t ep = nw_endpoint_create_host(ip, port);
++    char ports[8]; snprintf(ports, sizeof ports, "%u", port ? port : C.server_port);
++    nw_endpoint_t ep = nw_endpoint_create_host(ip, ports);
+     nw_parameters_t params = nw_parameters_create_secure_tcp(^(nw_protocol_options_t tls) {
+         sec_protocol_options_t so = nw_tls_copy_sec_protocol_options(tls);
+         sec_protocol_options_set_tls_server_name(so, server_name.UTF8String);
+diff --git a/dm/host/net_online.h b/dm/host/net_online.h
+index 710b903..6f94846 100644
+--- a/dm/host/net_online.h
++++ b/dm/host/net_online.h
+@@ -56,8 +56,9 @@ int nx_dest_allowed(uint32_t ip, int udp);
+ 
+ // A TCP connection to the bridge: a connected host stream socket whose other end the bridge carries to the game server in TLS. -1 on failure
+ // (errno set). The game's descriptor wraps the returned socket like any other. sni: the server name the TLS connection asks for (NULL: the
+-// running game's, nx_game_host). rewrite_host: the first request's Host header becomes that name (the NEX login sent to the stand-in address)
+-int nx_bridge_open(const char *sni, int rewrite_host);
++// running game's, nx_game_host). rewrite_host: the first request's Host header becomes that name (the NEX login sent to the stand-in address).
++// port: the server port to dial (0: the configured one, DM_NEXTENDO_SERVER's). The game's secure (post-login) connection names its own port
++int nx_bridge_open(const char *sni, int rewrite_host, uint16_t port);
+ int nx_is_server(uint32_t ip);        // ip (host order) is Nextendo's game server
+ 
+ // The account. nx_account_ready signs in when no account is stored (an in-app browser sheet; the caller's thread waits, up to timeout_ms)
+diff --git a/dm/host/tests/t_net_eventfd.c b/dm/host/tests/t_net_eventfd.c
+index 9ba2d28..d6a8324 100644
+--- a/dm/host/tests/t_net_eventfd.c
++++ b/dm/host/tests/t_net_eventfd.c
+@@ -14,7 +14,7 @@ int dm_net_online(void) { return 0; }
+ int nx_log_on(void) { return 0; }
+ int nx_resolve(const char *name, uint32_t *ip) { (void)name; (void)ip; return 0; }
+ int nx_dest_allowed(uint32_t ip, int udp) { (void)ip; (void)udp; return 0; }
+-int nx_bridge_open(const char *sni, int rewrite_host) { (void)sni; (void)rewrite_host; return -1; }
++int nx_bridge_open(const char *sni, int rewrite_host, uint16_t port) { (void)sni; (void)rewrite_host; (void)port; return -1; }
+ int nx_is_server(uint32_t ip) { (void)ip; return 0; }
+ void *objmap_get(const void *g) { (void)g; return NULL; }
+ void objmap_put(const void *g, void *h) { (void)g; (void)h; }
