@@ -19,6 +19,7 @@ call :one nextendo-fd3-for-v1.3.0 SK_FD_FIRST dm\host\hle_net.c || exit /b 1
 call :one nextendo-errno-for-v1.3.0 sk_err_linux dm\host\hle_net.c || exit /b 1
 call :one nextendo-secure-for-v1.3.0 uint16_t dm\host\net_online.h || exit /b 1
 call :one nextendo-udp-for-v1.3.0 park_take dm\host\hle_net.c || exit /b 1
+call :one nextendo-piatrace-for-v1.3.0 getsockname dm\host\hle_net.c || exit /b 1
 echo.
 echo All Nextendo patches are in. Rebuild the game in the launcher.
 exit /b 0

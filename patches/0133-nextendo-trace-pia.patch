@@ -1,0 +1,77 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: yewsifofficial <yewsifofficial@gmail.com>
+Date: Tue, 10 Nov 2026 15:53:03 -0500
+Subject: [PATCH] net: trace connect/getsockname and decode unresolved names,
+ to find where Pia stalls
+
+The parking change applied but the match test still fails the same way: the
+secure session is healthy, then Pia resolves nncs1/nncs2 to the right two
+addresses, creates and closes three UDP sockets with no bind/send/recv
+between them, and the game reports an unstable connection. connect() and
+getsockname() were the two socket calls the trace did not cover, and a UDP
+NAT probe sets its target through connect(); the garbled 5-byte name the
+resolver refused is likely a binary address passed where a hostname was
+expected. This traces both, and prints a short unprintable name as octets,
+so the next log shows whether Pia connects to a bad address and where that
+address comes from. No behavior change.
+
+Upstream-Status: fork-only (online play is out of nxnative's scope)
+Reason: diagnosing Pia NAT traversal for Super Smash Bros. Ultimate on Nextendo
+Issue: TODO
+
+Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_017xdHQoEipBX2wTqN8BNnMv
+---
+ dm/host/hle_net.c            | 4 +++-
+ dm/host/net_nextendo_apple.m | 6 +++++-
+ 2 files changed, 8 insertions(+), 2 deletions(-)
+
+diff --git a/dm/host/hle_net.c b/dm/host/hle_net.c
+index 7f61473..68bffbb 100644
+--- a/dm/host/hle_net.c
++++ b/dm/host/hle_net.c
+@@ -312,7 +312,7 @@ static int on_socket(int family, int type, int proto) {
+     }
+     pthread_mutex_unlock(&g_efd_m);
+     if (fd < 0) { close(h); LOG("[RED] net: more than %d descriptors", EFD_MAX); return on_err(EMFILE); }
+-    NXLOG("socket %d: %s", fd, type == SK_SOCK_STREAM ? "TCP" : "UDP");
++    NXLOG("socket %d: %s created", fd, type == SK_SOCK_STREAM ? "TCP" : "UDP");
+     return fd;
+ }
+ static int on_close(int fd) {
+@@ -350,6 +350,7 @@ static int on_connect(int fd, const void *a, unsigned n) {
+     struct sockaddr_in in;
+     if (!in_of(a, n, &in)) return on_err(EAFNOSUPPORT);
+     uint32_t ip = ntohl(in.sin_addr.s_addr);
++    { char d[24]; BTRACE(fd, "socket %d: connect %s (%s)", fd, ip_str(in.sin_addr.s_addr, in.sin_port, d), type == SK_SOCK_DGRAM ? "UDP" : "TCP"); }
+     if (!nx_dest_allowed(ip, type == SK_SOCK_DGRAM)) { NXLOG("socket %d: connect to %08x refused (not a Nextendo server)", fd, ip); return on_err(ECONNREFUSED); }
+     // Every TCP connection to Nextendo goes out in TLS, the server's key pinned: the stand-in address (the NEX login the observation gate
+     // points there) and the game server itself (the secure connection after the login, whose station URL names the server's host and its own
+@@ -472,6 +473,7 @@ static long on_send(int fd, const void *b, unsigned long len, int flags, const v
+ static int on_name(int fd, void *a, unsigned *n, int peer) {
+     int h = on_host(fd, NULL, NULL, NULL, NULL);
+     if (h < 0) return -1;
++    BTRACE(fd, "socket %d: get%sname", fd, peer ? "peer" : "sock");
+     pthread_mutex_lock(&g_efd_m); int br = sk_used(fd) && g_efd[fd].bridge; pthread_mutex_unlock(&g_efd_m);
+     struct sockaddr_in in; memset(&in, 0, sizeof in);
+     if (br) {   // the bridge's socket is a local one: the game sees the address it asked for, and its own as the host's
+diff --git a/dm/host/net_nextendo_apple.m b/dm/host/net_nextendo_apple.m
+index 43f54dc..bc48189 100644
+--- a/dm/host/net_nextendo_apple.m
++++ b/dm/host/net_nextendo_apple.m
+@@ -140,7 +140,11 @@ int nx_resolve(const char *name, uint32_t *ip) {
+     for (const char *p2 = name; *p2 && si < sizeof shown - 5; p2++)
+         si += (size_t)(*p2 >= 32 && *p2 < 127 ? (shown[si] = *p2, 1) : snprintf(shown + si, 5, "\\x%02x", (unsigned char)*p2));
+     shown[si] = 0;
+-    NXLOG("name %s (%zu bytes): not resolved (only Nintendo's names are, online)", shown, strlen(name));
++    size_t rawn = strlen(name);
++    if (rawn >= 4 && rawn <= 5) {   // a binary address passed where a hostname was expected shows up as a short unprintable "name"
++        const unsigned char *b = (const unsigned char *)name;
++        NXLOG("name (%zu bytes) %s = octets %u.%u.%u.%u: not resolved (looks like a binary address, not a hostname)", rawn, shown, b[0], b[1], b[2], b[3]);
++    } else NXLOG("name %s (%zu bytes): not resolved (only Nintendo's names are, online)", shown, rawn);
+     return 0;
+ }
+ int nx_is_server(uint32_t ip) { return dm_net_online() && ip == C.server; }
+-- 
+2.43.0
+
