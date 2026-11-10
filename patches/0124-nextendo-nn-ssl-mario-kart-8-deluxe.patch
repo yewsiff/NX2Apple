@@ -1,0 +1,401 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: yewsifofficial <yewsifofficial@gmail.com>
+Date: Tue, 10 Nov 2026 00:15:55 -0500
+Subject: [PATCH] net: nn::ssl through the Nextendo bridge, and Mario Kart 8
+ Deluxe online
+
+Online (DM_NEXTENDO=1), an nn::ssl connection's handshake on a socket
+connected to Nextendo's game server puts the TLS bridge in the socket's
+place, so a game whose NEX client logs in through nn::ssl needs no patch
+of its own. Mario Kart 8 Deluxe 4.0.1 joins the games the host takes
+online, and the launcher's Nextendo row shows for it. Not yet built with
+Xcode or run (docs/nextendo.md).
+
+Upstream-Status: fork-only (online play is out of nxnative's scope)
+Reason: Nextendo Network online play for Mario Kart 8 Deluxe
+Issue: TODO
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_017xdHQoEipBX2wTqN8BNnMv
+---
+ dm/games/0100152000022000/README.md |   3 +
+ dm/games/settings.py                |   1 +
+ dm/games/settings.tsv               |   4 +-
+ dm/host/hle_net.c                   | 106 ++++++++++++++++++++++++----
+ dm/host/net_nextendo_apple.m        |  18 +++--
+ dm/host/net_online.h                |  12 ++--
+ dm/host/tests/t_net_eventfd.c       |   6 +-
+ docs/env_switches.tsv               |   2 +-
+ docs/nextendo.md                    |  11 ++-
+ docs/settings.md                    |   2 +-
+ 10 files changed, 134 insertions(+), 31 deletions(-)
+
+diff --git a/dm/games/0100152000022000/README.md b/dm/games/0100152000022000/README.md
+index 9d60012..3782dbe 100644
+--- a/dm/games/0100152000022000/README.md
++++ b/dm/games/0100152000022000/README.md
+@@ -6,6 +6,9 @@ The 4.0.1 build has the same `subsdk0` and `sdk` build IDs as 4.0.0 and a differ
+ 
+ Brought up on the Mac from 4.0.0: boot, the title with its demo race, the Mii pick, the menus (their movie previews play), a 50cc Grand Prix race at Mario Kart Stadium to its results, and a second boot that loads the save. 60 fps (p50 16.7 ms), sound; about 2.4 GB resident and 1.26 GB of Metal allocations in the race, flat over minutes.
+ 
++
++Online play through Nextendo Network (`DM_NEXTENDO=1`) is written but not yet run: [docs/nextendo.md](../../../docs/nextendo.md).
++
+ ## What it needs
+ 
+ | Setting | Where | Why |
+diff --git a/dm/games/settings.py b/dm/games/settings.py
+index 65c6e4c..4e821d4 100644
+--- a/dm/games/settings.py
++++ b/dm/games/settings.py
+@@ -73,6 +73,7 @@ def build(gid, patched, control):
+         return macros[name].strip('"')
+ 
+     def shown(cond, n):
++        if '|' in cond: return any(shown(c, n) for c in cond.split('|'))   # alternatives, each a conjunction
+         if '&' in cond: return all(shown(c, n) for c in cond.split('&'))
+         if cond == 'always': return True
+         if cond == 'languages>1': return len(langs) > 1
+diff --git a/dm/games/settings.tsv b/dm/games/settings.tsv
+index 37529c9..7ee73ee 100644
+--- a/dm/games/settings.tsv
++++ b/dm/games/settings.tsv
+@@ -7,7 +7,7 @@
+ #             toggle: values - (on sets 1, off 0) or <on>/<off>, the two values the variable takes (on/off)
+ #   default   a value (a toggle's: 1 on, 0 off); DM_GAME_<NAME>: the host's own default from the game profile (game_profile.h, game.py); build:<VAR>: the IPA build's setting (build_ipa.sh)
+ #             <ios>|<mac> selects the platform's default before resolving a profile macro or build variable
+-#   shown     always; DM_GAME_<NAME>!=<value> or ==<value>; several joined by & must all hold; fixups:<KEY>: main's rewriter table has that key (a stub in the game's build, patch_nso.py); languages>1 (more than one to pick, so also when the control data lists none); gfxapi:<API>: the packer's GFXAPI;
++#   shown     always; DM_GAME_<NAME>!=<value> or ==<value>; several joined by & must all hold, and alternatives joined by | (each may be such a conjunction) need one to hold; fixups:<KEY>: main's rewriter table has that key (a stub in the game's build, patch_nso.py); languages>1 (more than one to pick, so also when the control data lists none); gfxapi:<API>: the packer's GFXAPI;
+ #             platform:<ios | mac>: the app's platform (SETTINGS_PLATFORM, ios when unset), for a switch only that platform's front end reads
+ #   section   Game, Controls or Performance: a heading on the single settings screen. Rows appear in table order within each section
+ #             Reset to tested defaults clears all launcher choices; values fixed by an env file stay
+@@ -22,7 +22,7 @@ DM_OPMODE	choice	1=Docked,0=Handheld	DM_GAME_OPMODE	always	Game	Console mode		le
+ DM_PRESENT_UPSCALE	choice	off=Standard,metalfx=MetalFX	off	always	Game	Upscaling	Uses more GPU time and can increase heat.
+ DM_UPSCALER	choice	game=Game's own,metalfx=MetalFX	game	DM_GAME_UPSCALER_N!=0	Game	Game's upscaler
+ DM_LANG	choice	languages	build:DM_LANG	languages>1	Game	Game language		level=basic
+-DM_NEXTENDO	toggle	-	0	DM_GAME_ID==01006A800016E000	Game	Nextendo online	Plays the game's Online mode through Nextendo Network, a community server. Asks you to sign in to your Nextendo account the first time you go online.
++DM_NEXTENDO	toggle	-	0	DM_GAME_ID==01006A800016E000|DM_GAME_ID==0100152000022000	Game	Nextendo online	Plays the game's Online mode through Nextendo Network, a community server. Asks you to sign in to your Nextendo account the first time you go online.
+ DM_FULLSCREEN	choice	0=Window,1=Fullscreen	0	platform:mac	Game	Display mode		level=basic
+ DM_PICTURE_FIT	choice	fit=Fit,fill=Fill	fit	platform:ios	Game	Picture	Fill crops the game's 16:9 picture to cover the screen. Health bars, subtitles or maps near the edges can be cut off. A full-screen picture without cropping needs a patch for each game.
+ DM_SHOW_FPS	toggle	-	build:DM_SHOW_FPS	platform:ios	Game	Frame-rate counter
+diff --git a/dm/host/hle_net.c b/dm/host/hle_net.c
+index 54bfda5..f59c84f 100644
+--- a/dm/host/hle_net.c
++++ b/dm/host/hle_net.c
+@@ -290,7 +290,7 @@ static int on_connect(int fd, const void *a, unsigned n) {
+     uint32_t ip = ntohl(in.sin_addr.s_addr);
+     if (!nx_dest_allowed(ip, type == SK_SOCK_DGRAM)) { NXLOG("socket %d: connect to %08x refused (not a Nextendo server)", fd, ip); return on_err(ECONNREFUSED); }
+     if (type == SK_SOCK_STREAM && ip == NX_BRIDGE_IP) {   // the game's NEX login: the bridge takes this descriptor's place
+-        int b = nx_bridge_open();
++        int b = nx_bridge_open(NULL, 1);
+         if (b < 0) return on_err(ECONNREFUSED);
+         if (dup2(b, h) < 0) { int e = errno; close(b); return on_err(e); }
+         close(b);
+@@ -607,6 +607,49 @@ HLE_FORCE("_ZN2nn6socket13GetHostByNameEPKc", "name resolution (cut: NULL; onlin
+ // ---------- ssl: offline, Initialize and a context's Create / Destroy succeed, everything else that contacts the service fails ----------
+ // A context is a session of the local ssl service, so on Horizon Create works with no network and only a connection needs one; DRAGON QUEST BUILDERS 2 ends its startup when Create fails (main+0x861260).
+ // Not cut: Context / Connection construction and destruction, Context::GetContextId (only read and write game objects).
++// Online (net_online.h): a connection is the game's socket with the TLS left to the bridge. The handshake of a socket connected to Nextendo's game server puts
++// a bridge's local socket in the host socket's place (the plain TCP connection it replaces is closed), asking for the host name the game set; after
++// that Read and Write are the socket's own, in plain bytes. The bridge checks the server's key against the pin, so the game's own certificate
++// choices (SetVerifyOption, the PKI calls) decide nothing. A handshake to any other address fails
++enum { SSL_WOULD_BLOCK = 0x1987B, SSL_TIMEOUT = 0x19A7B };   // nn::ssl::ResultIoWouldBlock (2123-0204), ResultIoTimeout (2123-0205)
++typedef struct { int fd, nonblock, keep_socket, shook; uint32_t last; char host[256]; } on_ssl;
++static on_ssl *ssl_of(void *self) { return dm_net_online() ? objmap_get(self) : NULL; }
++static Result on_ssl_handshake(on_ssl *c) {
++    if (c->shook) return RES_OK;
++    int h = on_host(c->fd, NULL, NULL, NULL, NULL);
++    if (h < 0) return c->last = RES_FAIL;
++    struct sockaddr_in in; socklen_t il = sizeof in;
++    if (getpeername(h, (struct sockaddr *)&in, &il) || !nx_is_server(ntohl(in.sin_addr.s_addr))) {
++        NXLOG("ssl: handshake on socket %d refused: not connected to the game server", c->fd);
++        return c->last = RES_FAIL;
++    }
++    int b = nx_bridge_open(c->host, 0);
++    if (b < 0) return c->last = RES_FAIL;
++    if (dup2(b, h) < 0) { close(b); return c->last = RES_FAIL; }
++    close(b);
++    fcntl(h, F_SETFL, fcntl(h, F_GETFL) | O_NONBLOCK);
++    pthread_mutex_lock(&g_efd_m); if (sk_used(c->fd)) g_efd[c->fd].bridge = 1; pthread_mutex_unlock(&g_efd_m);
++    c->shook = 1;
++    NXLOG("ssl: socket %d goes through the bridge (%s)", c->fd, c->host[0] ? c->host : "the game's server name");
++    return RES_OK;
++}
++// Read / Peek / Write: the count, or -1 with the connection's last error set (would block, for a connection in non-blocking mode)
++static int on_ssl_io(on_ssl *c, void *b, unsigned n, int peek, int wr) {
++    if (!c->shook) { c->last = RES_FAIL; return -1; }
++    int fl = c->nonblock ? SK_MSG_DONTWAIT : 0;
++    long r = wr ? on_send(c->fd, b, n, fl, NULL, 0) : on_recv(c->fd, b, n, fl | (peek ? MSG_PEEK : 0), NULL, NULL);
++    if (r >= 0) { c->last = RES_OK; return (int)r; }
++    c->last = t_skerr == EAGAIN ? SSL_WOULD_BLOCK : RES_FAIL;
++    return -1;
++}
++static Result on_ssl_poll(on_ssl *c, uint32_t *out, const uint32_t *in, unsigned ms) {   // PollEvent: 1 read, 2 write, 4 except
++    uint32_t want = in ? *in : 0;
++    sk_pollfd p = {c->fd, (int16_t)((want & 1 ? SK_POLLIN : 0) | (want & 2 ? SK_POLLOUT : 0)), 0};
++    int r = on_poll(&p, 1, (int)ms);
++    uint32_t got = (p.revents & (SK_POLLIN | SK_POLLRDNORM) ? 1 : 0) | (p.revents & SK_POLLOUT ? 2 : 0) | (p.revents & (POLLERR | POLLHUP | SK_POLLNVAL) ? 4 : 0);
++    if (out) *out = got;
++    return r > 0 ? RES_OK : SSL_TIMEOUT;
++}
+ #define SSF(m, cname, ...) HLE_FORCE(m, "ssl service (cut): fails", Result, cname, __VA_ARGS__)
+ HLE_FORCE("_ZN2nn3ssl10InitializeEv", "same as nnsslInitialize: succeeds, creates no session (cut)", Result, h_ssl_InitCpp, void) { return RES_OK; }
+ HLE_FORCE("_ZN2nn3ssl8FinalizeEv", "pairs with Initialize (cut)", Result, h_ssl_FinCpp, void) { return RES_OK; }
+@@ -616,19 +659,54 @@ SSF("_ZN2nn3ssl7Context19RegisterInternalPkiEPmNS1_11InternalPkiE", h_ssl_CtxReg
+ SSF("_ZN2nn3ssl7Context9RemovePkiEm", h_ssl_CtxRemovePki, void *self, uint64_t id) { (void)self; (void)id; return RES_FAIL; }
+ SSF("_ZN2nn3ssl14BuiltInManager28GetBuiltInCertificateBufSizeEPjPNS0_15CaCertificateIdEj", h_ssl_BiBufSize, uint32_t *o, void *ids, unsigned n) { (void)ids; (void)n; if (o) *o = 0; return RES_FAIL; }
+ SSF("_ZN2nn3ssl14BuiltInManager22GetBuiltInCertificatesEPPNS1_22BuiltInCertificateInfoEPhjPNS0_15CaCertificateIdEj", h_ssl_BiCerts, void **o, uint8_t *b, unsigned bs, void *ids, unsigned n) { (void)o; (void)b; (void)bs; (void)ids; (void)n; return RES_FAIL; }
+-SSF("_ZN2nn3ssl10Connection6CreateEPNS0_7ContextE", h_ssl_CnCreate, void *self, void *ctx) { (void)self; (void)ctx; return RES_FAIL; }
+-SSF("_ZN2nn3ssl10Connection7DestroyEv", h_ssl_CnDestroy, void *self) { (void)self; return RES_FAIL; }
+-SSF("_ZN2nn3ssl10Connection11DoHandshakeEv", h_ssl_CnHandshake, void *self) { (void)self; return RES_FAIL; }
+-SSF("_ZN2nn3ssl10Connection11SetHostNameEPKcj", h_ssl_CnHost, void *self, const char *h, unsigned n) { (void)self; (void)h; (void)n; return RES_FAIL; }
+-SSF("_ZN2nn3ssl10Connection9SetIoModeENS1_6IoModeE", h_ssl_CnIoMode, void *self, int m) { (void)self; (void)m; return RES_FAIL; }
+-SSF("_ZN2nn3ssl10Connection19SetSessionCacheModeENS1_16SessionCacheModeE", h_ssl_CnCache, void *self, int m) { (void)self; (void)m; return RES_FAIL; }
+-SSF("_ZN2nn3ssl10Connection19SetSocketDescriptorEi", h_ssl_CnSock, void *self, int s) { (void)self; (void)s; return RES_FAIL; }
+-SSF("_ZN2nn3ssl10Connection12GetLastErrorEPNS_6ResultE", h_ssl_CnLastErr, void *self, uint32_t *r) { (void)self; if (r) *r = RES_FAIL; return RES_FAIL; }
+-SSF("_ZN2nn3ssl10Connection18GetVerifyCertErrorEPNS_6ResultE", h_ssl_CnVerifyErr, void *self, uint32_t *r) { (void)self; if (r) *r = RES_FAIL; return RES_FAIL; }
+-SSF("_ZN2nn3ssl10Connection4PeekEPcPij", h_ssl_CnPeek, void *self, char *b, int *o, unsigned n) { (void)self; (void)b; (void)n; if (o) *o = 0; return RES_FAIL; }
+-SSF("_ZN2nn3ssl10Connection4PollEPNS1_9PollEventES3_j", h_ssl_CnPoll, void *self, void *o, void *i, unsigned t) { (void)self; (void)o; (void)i; (void)t; return RES_FAIL; }
+-HLE_FORCE("_ZN2nn3ssl10Connection4ReadEPcj", "ssl service (cut): read returns -1", int, h_ssl_CnRead, void *self, char *b, unsigned n) { (void)self; (void)b; (void)n; return -1; }
+-HLE_FORCE("_ZN2nn3ssl10Connection5WriteEPKcj", "ssl service (cut): write returns -1", int, h_ssl_CnWrite, void *self, const char *b, unsigned n) { (void)self; (void)b; (void)n; return -1; }
++SSF("_ZN2nn3ssl10Connection6CreateEPNS0_7ContextE", h_ssl_CnCreate, void *self, void *ctx) {
++    (void)ctx; if (!dm_net_online()) return RES_FAIL;
++    on_ssl *c = calloc(1, sizeof *c); if (!c) return RES_FAIL;
++    c->fd = -1; free(objmap_del(self)); objmap_put(self, c); return RES_OK;
++}
++SSF("_ZN2nn3ssl10Connection7DestroyEv", h_ssl_CnDestroy, void *self) {
++    on_ssl *c = ssl_of(self); if (!c) return RES_FAIL;
++    objmap_del(self);
++    if (c->fd >= 0 && !c->keep_socket) on_close(c->fd);   // the connection owns its socket (unless the game set DoNotCloseSocket)
++    free(c); return RES_OK;
++}
++SSF("_ZN2nn3ssl10Connection11DoHandshakeEv", h_ssl_CnHandshake, void *self) { on_ssl *c = ssl_of(self); return c ? on_ssl_handshake(c) : RES_FAIL; }
++SSF("_ZN2nn3ssl10Connection11SetHostNameEPKcj", h_ssl_CnHost, void *self, const char *h, unsigned n) {
++    on_ssl *c = ssl_of(self); if (!c) return RES_FAIL;
++    size_t k = n < sizeof c->host - 1 ? n : sizeof c->host - 1;
++    memcpy(c->host, h ? h : "", h ? k : 0); c->host[h ? k : 0] = 0; c->host[strnlen(c->host, k)] = 0; return RES_OK;
++}
++SSF("_ZN2nn3ssl10Connection9SetIoModeENS1_6IoModeE", h_ssl_CnIoMode, void *self, int m) { on_ssl *c = ssl_of(self); if (!c) return RES_FAIL; c->nonblock = m == 2; return RES_OK; }   // IoMode: 1 blocking, 2 non-blocking
++SSF("_ZN2nn3ssl10Connection19SetSessionCacheModeENS1_16SessionCacheModeE", h_ssl_CnCache, void *self, int m) { (void)m; return ssl_of(self) ? RES_OK : RES_FAIL; }
++SSF("_ZN2nn3ssl10Connection19SetSocketDescriptorEi", h_ssl_CnSock, void *self, int s) { on_ssl *c = ssl_of(self); if (!c) return RES_FAIL; c->fd = s; return RES_OK; }
++SSF("_ZN2nn3ssl10Connection12GetLastErrorEPNS_6ResultE", h_ssl_CnLastErr, void *self, uint32_t *r) { on_ssl *c = ssl_of(self); if (c) { if (r) *r = c->last; return RES_OK; } if (r) *r = RES_FAIL; return RES_FAIL; }
++SSF("_ZN2nn3ssl10Connection18GetVerifyCertErrorEPNS_6ResultE", h_ssl_CnVerifyErr, void *self, uint32_t *r) { if (ssl_of(self)) { if (r) *r = RES_OK; return RES_OK; } if (r) *r = RES_FAIL; return RES_FAIL; }
++SSF("_ZN2nn3ssl10Connection4PeekEPcPij", h_ssl_CnPeek, void *self, char *b, int *o, unsigned n) {
++    on_ssl *c = ssl_of(self);
++    if (c) { int r = on_ssl_io(c, b, n, 1, 0); if (o) *o = r < 0 ? 0 : r; return r < 0 ? c->last : RES_OK; }
++    if (o) *o = 0; return RES_FAIL;
++}
++SSF("_ZN2nn3ssl10Connection4PollEPNS1_9PollEventES3_j", h_ssl_CnPoll, void *self, void *o, void *i, unsigned t) { on_ssl *c = ssl_of(self); return c ? on_ssl_poll(c, o, i, t) : RES_FAIL; }
++HLE_FORCE("_ZN2nn3ssl10Connection4ReadEPcj", "ssl service (cut): read returns -1", int, h_ssl_CnRead, void *self, char *b, unsigned n) { on_ssl *c = ssl_of(self); return c ? on_ssl_io(c, b, n, 0, 0) : -1; }
++HLE_FORCE("_ZN2nn3ssl10Connection5WriteEPKcj", "ssl service (cut): write returns -1", int, h_ssl_CnWrite, void *self, const char *b, unsigned n) { on_ssl *c = ssl_of(self); return c ? on_ssl_io(c, (void *)b, n, 0, 1) : -1; }
++// The other forms of these calls and the options a game sets before its handshake: none was needed offline, where Create fails first
++SSF("_ZN2nn3ssl10Connection11DoHandshakeEPjS2_", h_ssl_CnHandshake2, void *self, uint32_t *certsize, uint32_t *certcount) {
++    on_ssl *c = ssl_of(self); if (certsize) *certsize = 0; if (certcount) *certcount = 0; return c ? on_ssl_handshake(c) : RES_FAIL;
++}
++SSF("_ZN2nn3ssl10Connection4ReadEPcPij", h_ssl_CnRead2, void *self, char *b, int *o, unsigned n) {
++    on_ssl *c = ssl_of(self); if (!c) { if (o) *o = 0; return RES_FAIL; }
++    int r = on_ssl_io(c, b, n, 0, 0); if (o) *o = r < 0 ? 0 : r; return r < 0 ? c->last : RES_OK;
++}
++SSF("_ZN2nn3ssl10Connection5WriteEPKcPij", h_ssl_CnWrite2, void *self, const char *b, int *o, unsigned n) {
++    on_ssl *c = ssl_of(self); if (!c) { if (o) *o = 0; return RES_FAIL; }
++    int r = on_ssl_io(c, (void *)b, n, 0, 1); if (o) *o = r < 0 ? 0 : r; return r < 0 ? c->last : RES_OK;
++}
++SSF("_ZN2nn3ssl10Connection15SetVerifyOptionENS1_12VerifyOptionE", h_ssl_CnVerifyOpt, void *self, int v) { (void)v; return ssl_of(self) ? RES_OK : RES_FAIL; }
++SSF("_ZN2nn3ssl10Connection9SetOptionENS1_10OptionTypeEb", h_ssl_CnSetOpt, void *self, int opt, unsigned on) {   // OptionType 0: DoNotCloseSocket
++    on_ssl *c = ssl_of(self); if (!c) return RES_FAIL; if (opt == 0) c->keep_socket = on & 1; return RES_OK;
++}
++SSF("_ZN2nn3ssl10Connection19GetSocketDescriptorEPi", h_ssl_CnGetSock, void *self, int *s) { on_ssl *c = ssl_of(self); if (!c) return RES_FAIL; if (s) *s = c->fd; return RES_OK; }
++HLE_FORCE("_ZN2nn3ssl10Connection7PendingEv", "ssl service (cut): nothing pending", int, h_ssl_CnPending, void *self) { (void)self; return 0; }
+ // C interface: all return nnResult
+ #define SSC(m, cname) HLE_FORCE(m, "ssl service (cut): fails", Result, cname, void) { return RES_FAIL; }
+ SSC("nnsslConnectionCreate", h_nssl_Create) SSC("nnsslConnectionDestroy", h_nssl_Destroy)
+diff --git a/dm/host/net_nextendo_apple.m b/dm/host/net_nextendo_apple.m
+index 95ec326..834a584 100644
+--- a/dm/host/net_nextendo_apple.m
++++ b/dm/host/net_nextendo_apple.m
+@@ -51,6 +51,7 @@ typedef struct { const char *id, *host, *version; } nx_game;
+ // The games this host takes online: title ID, the NEX game server's name (g<game server ID>-lp1.s.n.srv.nintendo.net), the version the ID token names
+ static const nx_game k_games[] = {
+     {"01006A800016E000", "g23380901-lp1.s.n.srv.nintendo.net", "13.0.5"},   // Super Smash Bros. Ultimate 13.0.5
++    {"0100152000022000", "g2b309e01-lp1.s.n.srv.nintendo.net", "4.0.1"},    // Mario Kart 8 Deluxe 4.0.1 (the name its NEX client asks nn::ssl for is the one used; this is the fallback)
+ };
+ static struct {
+     int online, log;
+@@ -136,6 +137,7 @@ int nx_resolve(const char *name, uint32_t *ip) {
+     NXLOG("name %s: not resolved (only Nintendo's names are, online)", n);
+     return 0;
+ }
++int nx_is_server(uint32_t ip) { return dm_net_online() && ip == C.server; }
+ int nx_dest_allowed(uint32_t ip, int udp) {
+     if (!dm_net_online()) return 0;
+     if (udp) return 1;
+@@ -581,6 +583,7 @@ static int trust_matches_pin(sec_trust_t trust) {
+     dispatch_source_t rd;
+     nw_connection_t conn;
+     NSMutableData *pending;   // what the game sent before the connection was ready, or the first request while its header is incomplete
++    NSString *sni;            // the server name asked for, and the first request's Host when the header is rewritten
+     int ready, closed, header_done;
+ }
+ - (void)close {
+@@ -595,7 +598,7 @@ static int trust_matches_pin(sec_trust_t trust) {
+     NSString *s = [[NSString alloc] initWithData:req encoding:NSISOLatin1StringEncoding];
+     NSMutableArray *lines = [[s componentsSeparatedByString:@"\r\n"] mutableCopy];
+     for (NSUInteger i = 1; i < lines.count; i++)
+-        if ([[lines[i] lowercaseString] hasPrefix:@"host:"]) { lines[i] = [@"Host: " stringByAppendingString:@(nx_game_host())]; break; }
++        if ([[lines[i] lowercaseString] hasPrefix:@"host:"]) { lines[i] = [@"Host: " stringByAppendingString:sni]; break; }
+     return [[lines componentsJoinedByString:@"\r\n"] dataUsingEncoding:NSISOLatin1StringEncoding];
+ }
+ - (void)upstream:(NSData *)d {
+@@ -647,15 +650,15 @@ static int trust_matches_pin(sec_trust_t trust) {
+ 
+ static NSMutableSet *g_bridges;   // keeps each bridge alive until it closes (on its own queue)
+ 
+-static int bridge_open_(void);
+-int nx_bridge_open(void) {
++static int bridge_open_(const char *sni, int rewrite_host);
++int nx_bridge_open(const char *sni, int rewrite_host) {
+     if (!dm_net_online()) { errno = ENETDOWN; return -1; }
+     __block int fd = -1, err = 0;
+-    on_host_thread(^{ fd = bridge_open_(); err = errno; });
++    on_host_thread(^{ fd = bridge_open_(sni, rewrite_host); err = errno; });
+     if (fd < 0) errno = err;
+     return fd;
+ }
+-static int bridge_open_(void) {
++static int bridge_open_(const char *sni, int rewrite_host) {
+     int sv[2];
+     if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv)) return -1;
+     int nos = 1;
+@@ -666,6 +669,9 @@ static int bridge_open_(void) {
+     b->fd = sv[1];
+     b->q = dispatch_queue_create("nextendo.bridge", DISPATCH_QUEUE_SERIAL);
+     b->pending = [NSMutableData data];
++    b->sni = @(sni && *sni ? sni : nx_game_host());
++    b->header_done = !rewrite_host;
++    NSString *server_name = b->sni;
+     char ip[16];
+     struct in_addr ia = {htonl(C.server)};
+     inet_ntop(AF_INET, &ia, ip, sizeof ip);
+@@ -673,7 +679,7 @@ static int bridge_open_(void) {
+     nw_endpoint_t ep = nw_endpoint_create_host(ip, port);
+     nw_parameters_t params = nw_parameters_create_secure_tcp(^(nw_protocol_options_t tls) {
+         sec_protocol_options_t so = nw_tls_copy_sec_protocol_options(tls);
+-        sec_protocol_options_set_tls_server_name(so, nx_game_host());
++        sec_protocol_options_set_tls_server_name(so, server_name.UTF8String);
+         sec_protocol_options_set_min_tls_protocol_version(so, tls_protocol_version_TLSv12);
+         sec_protocol_options_set_verify_block(so, ^(sec_protocol_metadata_t md, sec_trust_t trust, sec_protocol_verify_complete_t complete) {
+             (void)md;
+diff --git a/dm/host/net_online.h b/dm/host/net_online.h
+index 262a8f3..710b903 100644
+--- a/dm/host/net_online.h
++++ b/dm/host/net_online.h
+@@ -1,5 +1,5 @@
+ // Online play through Nextendo Network (https://nextendo.network), a community server for Switch games: the host's side of it.
+-// Off unless DM_NEXTENDO=1 and the game is one this host knows how to take online (Super Smash Bros. Ultimate 13.0.5 so far). Off, every
++// Off unless DM_NEXTENDO=1 and the game is one this host knows how to take online (Super Smash Bros. Ultimate 13.0.5 and Mario Kart 8 Deluxe 4.0.1 so far). Off, every
+ // network call keeps its offline answer (hle_net.c, hle_account.c), so no other game changes.
+ //
+ // The pieces (docs/nextendo.md has the whole picture):
+@@ -10,7 +10,9 @@
+ //             PID as "sub" and the NEX login token as "nnex", which is what Nextendo's game server checks
+ //   names     every *.nintendo.net name the game resolves is Nextendo's: nncs2-* (Pia's second NAT check server) is their NAT check, every
+ //             other one their game server. Nothing else resolves
+-//   NEX       the game's NEX client is pointed at a stand-in address (NX_BRIDGE_IP, observation gate OBS_NEX_LOGIN on its login job) where it
++//   TLS       nn::ssl: a connection's handshake on a socket connected to the game server puts the bridge in the socket's place, so the game's
++//             own TLS client (NEX over nn::ssl: Mario Kart 8 Deluxe) reads and writes plain bytes the bridge carries in TLS, the key pinned
++//   NEX       (Super Smash Bros. Ultimate) the game's NEX client is pointed at a stand-in address (NX_BRIDGE_IP, observation gate OBS_NEX_LOGIN on its login job) where it
+ //             speaks its WebSocket without TLS; a TCP connection there is a bridge that carries it to Nextendo's game server in TLS, the
+ //             server's key pinned (Network.framework). Pia's UDP goes straight to the other players, as on a console
+ //
+@@ -53,8 +55,10 @@ int nx_resolve(const char *name, uint32_t *ip);
+ int nx_dest_allowed(uint32_t ip, int udp);
+ 
+ // A TCP connection to the bridge: a connected host stream socket whose other end the bridge carries to the game server in TLS. -1 on failure
+-// (errno set). The game's descriptor wraps the returned socket like any other
+-int nx_bridge_open(void);
++// (errno set). The game's descriptor wraps the returned socket like any other. sni: the server name the TLS connection asks for (NULL: the
++// running game's, nx_game_host). rewrite_host: the first request's Host header becomes that name (the NEX login sent to the stand-in address)
++int nx_bridge_open(const char *sni, int rewrite_host);
++int nx_is_server(uint32_t ip);        // ip (host order) is Nextendo's game server
+ 
+ // The account. nx_account_ready signs in when no account is stored (an in-app browser sheet; the caller's thread waits, up to timeout_ms)
+ // and makes sure a fresh NEX login token is in hand. 1 when ready
+diff --git a/dm/host/tests/t_net_eventfd.c b/dm/host/tests/t_net_eventfd.c
+index 0927088..a91f122 100644
+--- a/dm/host/tests/t_net_eventfd.c
++++ b/dm/host/tests/t_net_eventfd.c
+@@ -14,7 +14,11 @@ int dm_net_online(void) { return 0; }
+ int nx_log_on(void) { return 0; }
+ int nx_resolve(const char *name, uint32_t *ip) { (void)name; (void)ip; return 0; }
+ int nx_dest_allowed(uint32_t ip, int udp) { (void)ip; (void)udp; return 0; }
+-int nx_bridge_open(void) { return -1; }
++int nx_bridge_open(const char *sni, int rewrite_host) { (void)sni; (void)rewrite_host; return -1; }
++int nx_is_server(uint32_t ip) { (void)ip; return 0; }
++void *objmap_get(const void *g) { (void)g; return NULL; }
++void objmap_put(const void *g, void *h) { (void)g; (void)h; }
++void *objmap_del(const void *g) { (void)g; return NULL; }
+ int nx_account_ready(int timeout_ms) { (void)timeout_ms; return 0; }
+ uint32_t nx_local_ip(void) { return 0; }
+ uint64_t now_ns(void) { return guest_ns(); }
+diff --git a/docs/env_switches.tsv b/docs/env_switches.tsv
+index c605e4f..b1bdc32 100644
+--- a/docs/env_switches.tsv
++++ b/docs/env_switches.tsv
+@@ -124,7 +124,7 @@ DM_MOTION_LOG	diagnostic	`=1` logs player 1's mapped motion sample once a second
+ DM_MOVIE_TRACE	diagnostic	When set, the movie decoder logs every call with its thread and decoder (by default the first 12 calls, then every 2^k-th)
+ DM_MSL_DIR	path	Parent folder of the shader libraries: NVN loads from `b-<chain version>/` or the one file `b-<chain version>.img` beneath it, Vulkan from `vk/`, GL from `gl/`; the app and the Mac launcher set it
+ DM_NDVE_ENGINE	switch	`0` runs nn::ndve's movie network (Ocarina of Time's title and opening movies) as the game's 12 translated dispatches after its colour conversion instead of the host's kernels (dm/gfx/msl/ndve_engine.metal, on by default: the same output, about half the frame's GPU time on an M4 Pro); `ab` alternates with DM_AB; `check` runs the game's dispatches and the host's network beside them and logs every 300 frames how many texels of the two differ. The host's kernels take only the model they were written for, bound by its shaders' keys and its weights' layout (docs/reference/shaders.md, The NDVE movie network by the host)
+-DM_NEXTENDO	switch	`1` takes a supported game (Super Smash Bros. Ultimate 13.0.5) online through Nextendo Network, a community server: sockets, names, the account and the NEX login (docs/nextendo.md); the launcher's "Nextendo online" row sets it
++DM_NEXTENDO	switch	`1` takes a supported game (Super Smash Bros. Ultimate 13.0.5, Mario Kart 8 Deluxe 4.0.1) online through Nextendo Network, a community server: sockets, names, the account and the NEX login (docs/nextendo.md); the launcher's "Nextendo online" row sets it
+ DM_NEXTENDO_API	switch	The Nextendo account API (default `https://nextendo.network`); `http` only for a loopback test server
+ DM_NEXTENDO_CLIENT_ID	switch	The OAuth client ID of your application at nextendo.network/developers; without one the sign-in fails
+ DM_NEXTENDO_LOG	diagnostic	`1` logs every socket, name and bridge event of Nextendo online play (never the PID, tokens or codes)
+diff --git a/docs/nextendo.md b/docs/nextendo.md
+index 11da15b..3c8da5b 100644
+--- a/docs/nextendo.md
++++ b/docs/nextendo.md
+@@ -1,7 +1,7 @@
+ # Online play through Nextendo Network
+ 
+ [Nextendo Network](https://nextendo.network) is a community server for Switch games. With `DM_NEXTENDO=1` (the launcher's **Nextendo online** row) the host takes a supported
+-game online through it. Nintendo's servers are never contacted. Supported so far: **Super Smash Bros. Ultimate 13.0.5**. Every other game, and this one with the switch off,
++game online through it. Nintendo's servers are never contacted. Supported so far: **Super Smash Bros. Ultimate 13.0.5** and **Mario Kart 8 Deluxe 4.0.1**. Every other game, and this one with the switch off,
+ runs offline exactly as before.
+ 
+ > **Status: written, not yet run.** The code follows how Super Mario Bros. 35 Recomp signs in to Nextendo and how WindowSmash points Smash's NEX client at a server of its own.
+@@ -26,11 +26,18 @@ runs offline exactly as before.
+ | Sockets | `dm/host/hle_net.c`, `hle_offline.c` | `nn::socket` on the host's BSD sockets (non-blocking at the host; the game's blocking calls wait in slices). TCP reaches Nextendo only, UDP any address (Pia's peers) |
+ | nifm | `hle_net.c`, `hle_offline.c` | the network is available; the IP configuration is the host's |
+ | NEX login | `dm/games/01006A800016E000/patches.py`, `hle_net.c` | gate `OBS_NEX_LOGIN` on the login job gives NEX's NgsFacade a direct server address, `10.13.37.1:443`, where NEX speaks its WebSocket without TLS |
++| nn::ssl | `hle_net.c` | a connection's handshake on a socket connected to the game server swaps the bridge in for that socket, with the host name the game set; Read, Write, Peek and Poll are then the socket's. This is how Mario Kart 8 Deluxe's NEX client logs in, with no patch of the game |
+ | TLS bridge | `net_nextendo_apple.m` | a TCP connection to `10.13.37.1` is a local socket whose other end goes to the game server in TLS (Network.framework), the server's key pinned, the `Host` header rewritten |
+ 
++## Mario Kart 8 Deluxe
++
++Nothing in the game is patched: its NEX client connects to its game server's name (resolved to Nextendo's) and asks `nn::ssl` for the TLS, which the host answers with the
++bridge. The game needs no rebuild beyond the host itself. What is not known until it runs: which other `nn::ssl`, friends or account calls of SDK 4.4.0 it makes on the way to
++the lobby, and whether Nextendo expects anything of the ID token beyond what Smash's carries.
++
+ ## Known gaps
+ 
+-- Friends, presence, play reports, BCAT and `nn::ssl` stay cut. If Smash needs one of them before it reaches the Online menu, that hook is the next piece of work.
++- Friends, presence, play reports and BCAT stay cut, and `nn::ssl`'s certificate calls answer without doing anything (the bridge's pin is the check). If Smash needs one of them before it reaches the Online menu, that hook is the next piece of work.
+ - The login gate's offset and the facade layout are for `main` 21450c64… (13.0.5) only.
+ - Pia's NAT traversal runs on the host's UDP sockets unchanged; a network that blocks peer-to-peer UDP (some mobile networks) will not reach matches.
+ - Tokens, codes and the PID are never logged. The players in a match learn each other's IP address, as on a console.
+diff --git a/docs/settings.md b/docs/settings.md
+index f92362c..cdefcfc 100644
+--- a/docs/settings.md
++++ b/docs/settings.md
+@@ -299,7 +299,7 @@ A line like `DM_PRESENT_SNAP=0` in `Documents/env.txt` (in the Files app, under
+ | Rumble strength | `DM_RUMBLE_GAIN` | `0` to `3` |
+ | Rumble cutoff | `DM_RUMBLE_MIN` | `0` to `0.9` |
+ | Press a button to join | `DM_PAD_PRESS_TO_JOIN` | `1`, `0` |
+-| Nextendo online (Super Smash Bros. Ultimate) | `DM_NEXTENDO` | `1`, `0` |
++| Nextendo online (Super Smash Bros. Ultimate, Mario Kart 8 Deluxe) | `DM_NEXTENDO` | `1`, `0` |
+ | Upscaling | `DM_PRESENT_UPSCALE` | `off`, `metalfx` |
+ | Game's upscaler | `DM_UPSCALER` | `game`, `metalfx` |
+ | Frame buffering | `DM_PRESENT_SNAP` | `1`, `0` |
+-- 
+2.43.0
+
