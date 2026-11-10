@@ -1,0 +1,65 @@
+diff --git a/dm/host/hle_net.c b/dm/host/hle_net.c
+index 5441060..85c9d42 100644
+--- a/dm/host/hle_net.c
++++ b/dm/host/hle_net.c
+@@ -125,7 +125,7 @@ static int efd_read(int fd, uint64_t *out) {
+         if (!efd_used(fd)) { t_skerr = SK_EBADF; break; }
+         uint64_t *c = &g_efd[fd].count; int f = g_efd[fd].flags;
+         if (*c) { if (f & 1) { *out = 1; *c -= 1; } else { *out = *c; *c = 0; } efd_signal(fd); r = 0; break; }
+-        if (f & 6) { t_skerr = SK_EAGAIN; break; }
++        if (f & 6) { t_skerr = dm_net_online() ? 11 : SK_EAGAIN; break; }   // online: Linux's EAGAIN, as the game's library numbers errnos (sk_err_linux)
+         dm_guest_cond_wait_ns(&g_efd_c, &g_efd_m, dm_detclock_enabled() ? 1000000 : 100000000);
+     }
+     pthread_mutex_unlock(&g_efd_m);
+@@ -212,10 +212,32 @@ int dm_sk_select(int nfds, uint64_t *r, uint64_t *w, uint64_t *e, const int64_t
+ // the SOL_SOCKET options and the errno values are the ones Apple's BSD layer uses, so they pass through. The game's blocking calls are waits here,
+ // in slices, giving up the guest core meanwhile (hle_thread.c), on sockets the host keeps non-blocking.
+ enum { SK_AF_INET = 2, SK_SOCK_STREAM = 1, SK_SOCK_DGRAM = 2, SK_NONBLOCK_TYPE = 0x20000000, SK_O_NONBLOCK = 4, SK_O_NONBLOCK_ALT = 0x800,
+-       SK_F_GETFL = 3, SK_F_SETFL = 4, SK_SOL_SOCKET = 0xffff, SK_SO_SNDTIMEO = 0x1005, SK_SO_RCVTIMEO = 0x1006, SK_MSG_DONTWAIT = 0x80 };
++       SK_F_GETFL = 3, SK_F_SETFL = 4, SK_SOL_SOCKET = 0xffff, SK_SO_SNDTIMEO = 0x1005, SK_SO_RCVTIMEO = 0x1006, SK_SO_ERROR = 0x1007,
++       SK_MSG_DONTWAIT = 0x80 };
+ typedef struct { uint8_t len, family; uint16_t port; uint32_t addr; uint8_t zero[8]; } sk_in;
+ enum { SK_FD_FIRST = 3 };   // the first socket descriptor (see on_socket)   // nn::socket::SockAddrIn, network order
+-static int on_err(int e) { t_skerr = e; return -1; }
++// A failing call's errno, as the game's socket library numbers them: Linux's numbers, not the host's BSD ones. SM35 Recomp's
++// hostsock.h states it with a symptom ("the Switch's socket errno enum follows Linux ... with FreeBSD's 36 it never saw its relay
++// connection as pending"), and Smash's first online runs here matched: recv answered the host's 35 for would-block, the game's NEX
++// client took it as an error, polled out a grace period without ever reading the server's answer, and closed with 2306-0502.
++// Numbers below EPIPE are the same on both; everything that differs is mapped
++static int sk_err_linux(int e) {
++    switch (e) {
++    case EAGAIN: return 11;
++#if defined(EWOULDBLOCK) && EWOULDBLOCK != EAGAIN
++    case EWOULDBLOCK: return 11;
++#endif
++    case EINPROGRESS: return 115; case EALREADY: return 114; case ENOTSOCK: return 88; case EDESTADDRREQ: return 89;
++    case EMSGSIZE: return 90; case EPROTOTYPE: return 91; case ENOPROTOOPT: return 92; case EPROTONOSUPPORT: return 93;
++    case EOPNOTSUPP: return 95; case EAFNOSUPPORT: return 97; case EADDRINUSE: return 98; case EADDRNOTAVAIL: return 99;
++    case ENETDOWN: return 100; case ENETUNREACH: return 101; case ENETRESET: return 102; case ECONNABORTED: return 103;
++    case ECONNRESET: return 104; case ENOBUFS: return 105; case EISCONN: return 106; case ENOTCONN: return 107;
++    case ESHUTDOWN: return 108; case ETIMEDOUT: return 110; case ECONNREFUSED: return 111; case EHOSTDOWN: return 112;
++    case EHOSTUNREACH: return 113;
++    default: return e;
++    }
++}
++static int on_err(int e) { t_skerr = sk_err_linux(e); return -1; }
+ // DM_NEXTENDO_LOG: the game's calls on a bridge socket (the first ones of each kind), to see what it does with the server's answer
+ static _Atomic int g_trace_n;
+ static int bridge_fd(int fd);
+@@ -427,7 +449,15 @@ static int on_getsockopt(int fd, int level, int opt, void *v, unsigned *n) {
+     if (h < 0) return -1;
+     BTRACE(fd, "socket %d: getsockopt level %#x option %#x", fd, level, opt);
+     socklen_t l = n ? *n : 0;
+-    if (!getsockopt(h, level == SK_SOL_SOCKET ? SOL_SOCKET : level, opt, v, &l)) { if (n) *n = l; return 0; }
++    if (!getsockopt(h, level == SK_SOL_SOCKET ? SOL_SOCKET : level, opt, v, &l)) {
++        if (n) *n = l;
++        if (level == SK_SOL_SOCKET && opt == SK_SO_ERROR && v && l >= 4) {   // its value is an errno too
++            int e; memcpy(&e, v, 4);
++            if (e) e = sk_err_linux(e);
++            memcpy(v, &e, 4);
++        }
++        return 0;
++    }
+     return on_err(errno);
+ }
+ static int on_fcntl(int fd, int cmd, int val) {
