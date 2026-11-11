@@ -17,7 +17,7 @@ address comes from. No behavior change.
 
 Upstream-Status: fork-only (online play is out of nxnative's scope)
 Reason: diagnosing Pia NAT traversal for Super Smash Bros. Ultimate on Nextendo
-Issue: TODO
+Issue: yewsiff/NX2Apple (no tracker: issues are disabled on this fork)
 
 Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
 Claude-Session: https://claude.ai/code/session_017xdHQoEipBX2wTqN8BNnMv

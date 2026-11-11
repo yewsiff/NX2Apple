@@ -13,7 +13,7 @@ logged: the login carries the account's token.
 
 Upstream-Status: fork-only (online play is out of nxnative's scope)
 Reason: diagnosing Nextendo online play on devices
-Issue: TODO
+Issue: yewsiff/NX2Apple (no tracker: issues are disabled on this fork)
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 Claude-Session: https://claude.ai/code/session_017xdHQoEipBX2wTqN8BNnMv

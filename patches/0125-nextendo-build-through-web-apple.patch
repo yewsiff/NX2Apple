@@ -12,7 +12,7 @@ net_nextendo_apple.m and imports its frameworks where the builder's scan sees th
 
 Upstream-Status: fork-only (online play is out of nxnative's scope)
 Reason: Nextendo online play builds on Windows as well as the Mac
-Issue: TODO
+Issue: yewsiff/NX2Apple (no tracker: issues are disabled on this fork)
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 Claude-Session: https://claude.ai/code/session_017xdHQoEipBX2wTqN8BNnMv

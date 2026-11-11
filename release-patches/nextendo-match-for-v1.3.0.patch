@@ -1,0 +1,524 @@
+diff --git a/dm/games/01006A800016E000/patches.py b/dm/games/01006A800016E000/patches.py
+index 692e19f..4e4a822 100644
+--- a/dm/games/01006A800016E000/patches.py
++++ b/dm/games/01006A800016E000/patches.py
+@@ -33,6 +33,9 @@ CUTS = {
+ OBS_OPTIONAL = {
+   '21450c647b8c5940ed5b68218ea128fd': [
+     (0x249190, 27, 'f81b0ffc', "NEX login job entry: the job in x0; the host points its NgsFacade at the Nextendo bridge (OBS_NEX_LOGIN)"),
++    # Pia's "this job failed" (sub sp, sp, #0x50 at its entry; the job in x0, its result at [x1]): read only, logged online (OBS_PIA_FAIL). WindowSmash's finding for
++    # 13.0.5 as well (runtime/hle_net.c), where it logs the same thing
++    (0xb41f0, 28, 'd10143ff', "Pia job failure: the result at [x1], which the host logs online (OBS_PIA_FAIL)"),
+   ],
+ }
+ region = 'engine region 62 GB → 4 GB (11 instructions in four functions)'
+@@ -49,9 +52,12 @@ MATCH_CUTS = {'main': [{'name': region, 'functions': [
+ # How general each patch is and could be (dm/tools/docs_patches.py "Binding", listed in docs/agents/game-patches.md): what, its binding now, the loosest it could have (goal),
+ # purpose, why; blocked or kept: why the gap stays open (cannot close yet, or left open on purpose); checked: what was checked on game files (else a judgement)
+ BINDING = [
+-    {'what': 'NEX login gate (OBS_NEX_LOGIN, online play through Nextendo)', 'now': 'build', 'goal': 'game', 'purpose': 'online play',
++    {'what': 'NEX login gate (OBS_NEX_LOGIN, online play through Nextendo)', 'now': 'build', 'goal': 'game', 'purpose': 'runtime',
+      'blocked': 'the offset and the NgsFacade layout are known for 13.0.5 only',
+      'why': "the login job and the facade's direct-address fields are NEX's, compiled into this main"},
++    {'what': 'Pia job failure gate (OBS_PIA_FAIL, online diagnostics)', 'now': 'build', 'goal': 'game', 'purpose': 'runtime',
++     'blocked': 'the offset is known for 13.0.5 only',
++     'why': "the function is Pia's, compiled into this main; the gate only reads the result"},
+     {'what': 'engine region 62 GB → 4 GB (11 cuts in four functions)', 'now': 'game', 'goal': 'game', 'purpose': 'address space',
+      'checked': 'MATCH_CUTS enrolled on its builds',
+      'why': "function-matched for builds of the same code (MATCH_CUTS); the region and its node pool are the nu:: engine's own"},
+diff --git a/dm/host/dm.h b/dm/host/dm.h
+index c0f508b..af85d46 100644
+--- a/dm/host/dm.h
++++ b/dm/host/dm.h
+@@ -119,7 +119,8 @@ enum { OBS_UE_MALLOC = 21,                                       // Unreal's FMa
+        OBS_STDALLOC_INIT = 25,                                         // StandardAllocator::Initialize's entry, the same way: its callback writes the size (hle_svc.c)
+        OBS_UE_REGION = 26,                                             // the store of Unreal's engine region size before nninitStartup reserves it: the register its upper bits name (dm/tools/ue_region.py, hle_svc.c)
+        OBS_NEX_LOGIN = 27,                                             // a game's NEX login job, where the host points its NgsFacade at the Nextendo bridge (the game's patches.py, hle_net.c, net_online.h)
+-       OBS_MAX = 28 };
++       OBS_PIA_FAIL = 28,                                              // a Pia job marked failed, whose result the host logs online (the game's patches.py, hle_net.c)
++       OBS_MAX = 29 };
+ // A gate number's bits from 8 up are a parameter for its callback (OBS_REGION_GOT: the register that holds the address). Callbacks read the registers; a write to x0–x29 takes
+ // effect when the gate returns (entry.S restores them from the frame), which OBS_STDALLOC_INIT and OBS_UE_REGION do
+ void gate_obs_set(int id, void (*fn)(uint64_t *regs, int param));
+diff --git a/dm/host/hle_net.c b/dm/host/hle_net.c
+index 40f6702..29c9a1a 100644
+--- a/dm/host/hle_net.c
++++ b/dm/host/hle_net.c
+@@ -74,11 +74,14 @@ enum { EFD_MAX = 64, SK_POLLIN = 1, SK_POLLOUT = 4, SK_POLLRDNORM = 0x40, SK_POL
+ // One table for every descriptor the host hands out, so their numbers never clash: an event descriptor (host < 0), or online a socket (host is the
+ // host's own socket, always non-blocking at the host; nonblock is the game's own setting). Online, an event descriptor also has a pipe that holds
+ // one byte while its count is not zero (pr / pw), so a host poll can wait on it beside the sockets
+-static struct { uint64_t count; int used, flags; int host, pr, pw, type, nonblock, bridge, bport; int64_t rcv_ms, snd_ms; } g_efd[EFD_MAX];
++static struct { uint64_t count; int used, flags; int host, pr, pw, type, nonblock, bridge, bport; int64_t rcv_ms, snd_ms; uint32_t ntx, nrx, nfail; } g_efd[EFD_MAX];
+ static pthread_mutex_t g_efd_m = PTHREAD_MUTEX_INITIALIZER;
+ static pthread_cond_t g_efd_c = PTHREAD_COND_INITIALIZER;
+ static int efd_used(int fd) { return fd >= 0 && fd < EFD_MAX && g_efd[fd].used && g_efd[fd].host < 0; }   // with g_efd_m held: an event descriptor
+ static int sk_used(int fd) { return fd >= 0 && fd < EFD_MAX && g_efd[fd].used && g_efd[fd].host >= 0; }    // with g_efd_m held: a socket (online only)
++// Socket options the host socket does not take, as the game set them (on_setsockopt): n == 0 is a free slot (under g_efd_m; cleared when the descriptor is made)
++enum { SOPT_KEPT = 8 };
++static struct { int level, opt; unsigned n; uint8_t v[16]; } g_sopt[EFD_MAX][SOPT_KEPT];
+ static void efd_signal(int fd) {   // with g_efd_m held: the online pipe holds a byte exactly while the count is not zero
+     if (g_efd[fd].pr < 0) return;
+     char b[16];
+@@ -214,7 +217,7 @@ int dm_sk_select(int nfds, uint64_t *r, uint64_t *w, uint64_t *e, const int64_t
+ // the SOL_SOCKET options and the errno values are the ones Apple's BSD layer uses, so they pass through. The game's blocking calls are waits here,
+ // in slices, giving up the guest core meanwhile (hle_thread.c), on sockets the host keeps non-blocking.
+ enum { SK_AF_INET = 2, SK_SOCK_STREAM = 1, SK_SOCK_DGRAM = 2, SK_NONBLOCK_TYPE = 0x20000000, SK_O_NONBLOCK = 4, SK_O_NONBLOCK_ALT = 0x800,
+-       SK_F_GETFL = 3, SK_F_SETFL = 4, SK_SOL_SOCKET = 0xffff, SK_SO_SNDTIMEO = 0x1005, SK_SO_RCVTIMEO = 0x1006, SK_SO_ERROR = 0x1007,
++       SK_F_GETFL = 3, SK_F_SETFL = 4, SK_SOL_SOCKET = 0xffff, SK_SO_SNDTIMEO = 0x1005, SK_SO_RCVTIMEO = 0x1006, SK_SO_ERROR = 0x1007, SK_SO_TYPE = 0x1008,
+        SK_MSG_DONTWAIT = 0x80 };
+ typedef struct { uint8_t len, family; uint16_t port; uint32_t addr; uint8_t zero[8]; } sk_in;
+ enum { SK_FD_FIRST = 3 };   // the first socket descriptor (see on_socket)   // nn::socket::SockAddrIn, network order
+@@ -282,6 +285,12 @@ static int on_host(int fd, int *nb, int *type, int64_t *rcv, int64_t *snd) {   /
+     return h;
+ }
+ // Waits until the host socket has one of events, up to ms (< 0: no bound). 1 ready, 0 timed out, -1 the host is shutting the game down
++// A datagram socket's totals, for the line its close logs: what = 0 sent, 1 received, 2 a send that failed
++static void sk_count(int fd, int what) {
++    pthread_mutex_lock(&g_efd_m);
++    if (sk_used(fd)) { if (what == 0) g_efd[fd].ntx++; else if (what == 1) g_efd[fd].nrx++; else g_efd[fd].nfail++; }
++    pthread_mutex_unlock(&g_efd_m);
++}
+ static int sk_is_udp(int fd) { pthread_mutex_lock(&g_efd_m); int u = sk_used(fd) && g_efd[fd].type == SK_SOCK_DGRAM; pthread_mutex_unlock(&g_efd_m); return u; }
+ // A 16-byte datagram to or from a NAT check server, as Nextendo's responder documents it (nextendo-nncs, main.go): four big-endian
+ // words, a probe {test id, -, -, local IP} and its reply {test id, the port and the address the server saw us from, the server's}
+@@ -311,7 +320,7 @@ static int on_wait(int h, short events, int64_t ms) {
+     }
+ }
+ static int on_socket(int family, int type, int proto) {
+-    int nb = (type & SK_NONBLOCK_TYPE) != 0; type &= 0xff;
++    int nb = (type & (SK_NONBLOCK_TYPE | SK_O_NONBLOCK_ALT)) != 0; type &= 0xff;   // the flag in the type: FreeBSD's bit, or O_NONBLOCK's own value (WindowSmash takes both for this game)
+     if (family != SK_AF_INET || (type != SK_SOCK_STREAM && type != SK_SOCK_DGRAM)) return on_err(EAFNOSUPPORT);
+     int h = socket(AF_INET, type, proto);
+     if (h < 0) return on_err(errno);
+@@ -327,6 +336,7 @@ static int on_socket(int family, int type, int proto) {
+         memset(&g_efd[fd], 0, sizeof g_efd[fd]);
+         g_efd[fd].used = 1; g_efd[fd].host = h; g_efd[fd].pr = g_efd[fd].pw = -1; g_efd[fd].type = type; g_efd[fd].nonblock = nb;
+         g_efd[fd].rcv_ms = g_efd[fd].snd_ms = -1;
++        memset(g_sopt[fd], 0, sizeof g_sopt[fd]);
+     }
+     pthread_mutex_unlock(&g_efd_m);
+     if (fd < 0) { close(h); LOG("[RED] net: more than %d descriptors", EFD_MAX); return on_err(EMFILE); }
+@@ -337,15 +347,19 @@ static int on_close(int fd) {
+     BTRACE(fd, "socket %d: the game closes it", fd);
+     pthread_mutex_lock(&g_efd_m);
+     int h = sk_used(fd) ? g_efd[fd].host : -1;
+-    int parked = 0, port = h >= 0 ? g_efd[fd].bport : 0;
++    int parked = 0, port = h >= 0 ? g_efd[fd].bport : 0, udp = 0;
++    uint32_t ntx = 0, nrx = 0, nfail = 0;
+     if (h >= 0) {
+-        if (g_efd[fd].type == SK_SOCK_DGRAM && port) parked = park_put(h, (uint16_t)port);
++        udp = g_efd[fd].type == SK_SOCK_DGRAM; ntx = g_efd[fd].ntx; nrx = g_efd[fd].nrx; nfail = g_efd[fd].nfail;
++        if (udp && port) parked = park_put(h, (uint16_t)port);
+         g_efd[fd].used = 0; g_efd[fd].host = -1;
+     }
+     pthread_mutex_unlock(&g_efd_m);
+     if (h < 0) return efd_close(fd);
+     if (!parked) close(h);
+-    NXLOG("socket %d: closed%s", fd, parked ? " (its UDP port stays parked for a rebind)" : "");
++    // A datagram socket's totals are logged whatever the trace budget: "bound, nothing sent" and "sent, nothing came back" are different faults
++    if (udp) NXLOG("socket %d: closed%s; UDP port %d, %u datagrams sent (%u sends failed), %u received", fd, parked ? " (the port stays parked for a rebind)" : "", port, ntx, nfail, nrx);
++    else NXLOG("socket %d: closed", fd);
+     return 0;
+ }
+ static int in_of(const void *a, unsigned n, struct sockaddr_in *out) {   // the game's address as the host's
+@@ -453,6 +467,7 @@ static long on_recv(int fd, void *b, unsigned long len, int flags, void *a, unsi
+     for (;;) {
+         struct sockaddr_in in; socklen_t il = sizeof in;
+         ssize_t r = recvfrom(h, b, len, flags, a ? (struct sockaddr *)&in : NULL, a ? &il : NULL);
++        if (r >= 0 && type == SK_SOCK_DGRAM) sk_count(fd, 1);
+         if (r >= 0 && a && type == SK_SOCK_DGRAM) { char d[24]; BTRACE(fd, "socket %d: recvfrom -> %ld from %s", fd, (long)r, ip_str(in.sin_addr.s_addr, in.sin_port, d)); nat_note("reply", b, (long)r, in.sin_addr.s_addr, in.sin_port); }
+         else BTRACE(fd, "socket %d: recv up to %lu (flags %#x%s) -> %ld%s%s", fd, len, flags, nb ? ", non-blocking" : "", (long)r, r < 0 ? ", errno " : "", r < 0 ? strerror(errno) : "");
+         if (r >= 0) {
+@@ -479,6 +494,7 @@ static long on_send(int fd, const void *b, unsigned long len, int flags, const v
+     }
+     for (;;) {
+         ssize_t r = to ? sendto(h, b, len, flags, (struct sockaddr *)&in, sizeof in) : send(h, b, len, flags);
++        if (type == SK_SOCK_DGRAM && (r >= 0 || errno != EAGAIN)) { int e = errno; sk_count(fd, r >= 0 ? 0 : 2); errno = e; }
+         if (to) { char d[24]; BTRACE(fd, "socket %d: sendto %lu -> %ld, %s%s%s", fd, len, (long)r, ip_str(in.sin_addr.s_addr, in.sin_port, d), r < 0 ? ", errno " : "", r < 0 ? strerror(errno) : ""); nat_note("probe", b, (long)len, in.sin_addr.s_addr, in.sin_port); }
+         else BTRACE(fd, "socket %d: send %lu -> %ld%s%s", fd, len, (long)r, r < 0 ? ", errno " : "", r < 0 ? strerror(errno) : "");
+         if (r >= 0) return r;
+@@ -504,6 +520,46 @@ static int on_name(int fd, void *a, unsigned *n, int peer) {
+     in_to(&in, a, n);
+     return 0;
+ }
++// Socket options. Horizon's numbers are FreeBSD's, and Apple's are the same only for the classic set: above it the same number is another option here (SOL_SOCKET
++// 0x800 is SO_NOSIGPIPE there and a timestamp option here; IP option 65 is IP_RECVTTL there and a background traffic class here). So only the options whose number and
++// meaning agree reach the host socket, the ones SM35 Recomp passes on (bsd_host.c map_opt): SOL_SOCKET reuse-address, keep-alive, broadcast, out-of-band inline,
++// reuse-port, the two buffer sizes, the error and the type; TCP no-delay; IP type-of-service and time-to-live. Every other option is accepted and kept, and read
++// back as it was set (zero when it never was): Nextendo's own Ryujinx build found a client that closes its socket when an option it set cannot be read back
++static int sk_opt_host(int level, int opt, int *hl) {
++    if (level == SK_SOL_SOCKET) { *hl = SOL_SOCKET; return opt == 0x4 || opt == 0x8 || opt == 0x20 || opt == 0x100 || opt == 0x200 || opt == 0x1001 || opt == 0x1002 || opt == SK_SO_ERROR || opt == SK_SO_TYPE; }
++    if (level == 6) { *hl = IPPROTO_TCP; return opt == 1; }
++    if (level == 0) { *hl = IPPROTO_IP; return opt == 3 || opt == 4; }
++    return 0;
++}
++static void sopt_keep(int fd, int level, int opt, const void *v, unsigned n) {
++    if (!v || !n) return;
++    pthread_mutex_lock(&g_efd_m);
++    if (sk_used(fd)) {
++        int at = -1;
++        for (int i = 0; i < SOPT_KEPT; i++) {
++            if (g_sopt[fd][i].n && g_sopt[fd][i].level == level && g_sopt[fd][i].opt == opt) { at = i; break; }
++            if (!g_sopt[fd][i].n && at < 0) at = i;
++        }
++        if (at >= 0) {
++            g_sopt[fd][at].level = level; g_sopt[fd][at].opt = opt; g_sopt[fd][at].n = n < sizeof g_sopt[fd][at].v ? n : (unsigned)sizeof g_sopt[fd][at].v;
++            memcpy(g_sopt[fd][at].v, v, g_sopt[fd][at].n);
++        }
++    }
++    pthread_mutex_unlock(&g_efd_m);
++}
++static unsigned sopt_kept(int fd, int level, int opt, void *v, unsigned cap) {   // the kept value's length, 0 when the option was never set
++    unsigned n = 0;
++    pthread_mutex_lock(&g_efd_m);
++    if (sk_used(fd))
++        for (int i = 0; i < SOPT_KEPT; i++)
++            if (g_sopt[fd][i].n && g_sopt[fd][i].level == level && g_sopt[fd][i].opt == opt) {
++                n = g_sopt[fd][i].n < cap ? g_sopt[fd][i].n : cap;
++                if (v) memcpy(v, g_sopt[fd][i].v, n);
++                break;
++            }
++    pthread_mutex_unlock(&g_efd_m);
++    return n;
++}
+ static int on_setsockopt(int fd, int level, int opt, const void *v, unsigned n) {
+     int h = on_host(fd, NULL, NULL, NULL, NULL);
+     if (h < 0) return -1;
+@@ -516,39 +572,61 @@ static int on_setsockopt(int fd, int level, int opt, const void *v, unsigned n)
+         pthread_mutex_unlock(&g_efd_m);
+         return 0;
+     }
+-    if (!setsockopt(h, level == SK_SOL_SOCKET ? SOL_SOCKET : level, opt, v, n)) return 0;
+-    NXLOG("socket %d: option %#x/%#x not taken by the host (%s): ignored", fd, level, opt, strerror(errno));
+-    return 0;   // an option the host lacks (Horizon's own, or a TCP one on the bridge's local socket) changes nothing the game can see
++    int hl;
++    if (sk_opt_host(level, opt, &hl) && v && n) {   // each of them is an int
++        int x = 0; memcpy(&x, v, n < sizeof x ? n : sizeof x);
++        if (!setsockopt(h, hl, opt, &x, sizeof x)) return 0;
++        BTRACE(fd, "socket %d: option %#x/%#x not taken by the host socket (%s): kept as set", fd, level, opt, strerror(errno));   // (a TCP option on the bridge's local socket)
++    }
++    sopt_keep(fd, level, opt, v, n);
++    return 0;
+ }
+ static int on_getsockopt(int fd, int level, int opt, void *v, unsigned *n) {
+-    int h = on_host(fd, NULL, NULL, NULL, NULL);
++    int type; int64_t rcv, snd;
++    int h = on_host(fd, NULL, &type, &rcv, &snd);
+     if (h < 0) return -1;
+     BTRACE(fd, "socket %d: getsockopt level %#x option %#x", fd, level, opt);
+-    socklen_t l = n ? *n : 0;
+-    if (!getsockopt(h, level == SK_SOL_SOCKET ? SOL_SOCKET : level, opt, v, &l)) {
+-        if (n) *n = l;
+-        if (level == SK_SOL_SOCKET && opt == SK_SO_ERROR && v && l >= 4) {   // its value is an errno too
+-            int e; memcpy(&e, v, 4);
+-            if (e) e = sk_err_linux(e);
+-            memcpy(v, &e, 4);
+-        }
++    unsigned cap = n ? *n : 0;
++    if (level == SK_SOL_SOCKET && (opt == SK_SO_RCVTIMEO || opt == SK_SO_SNDTIMEO)) {   // what setsockopt kept
++        int64_t ms = opt == SK_SO_RCVTIMEO ? rcv : snd;
++        int64_t tv[2] = {ms > 0 ? ms / 1000 : 0, ms > 0 ? ms % 1000 * 1000 : 0};
++        if (v) memcpy(v, tv, cap < sizeof tv ? cap : sizeof tv);
++        if (n) *n = sizeof tv;
+         return 0;
+     }
+-    return on_err(errno);
++    int hl;
++    if (sk_opt_host(level, opt, &hl)) {
++        int x = 0; socklen_t l = sizeof x;
++        if (!getsockopt(h, hl, opt, &x, &l)) {
++            if (level == SK_SOL_SOCKET && opt == SK_SO_ERROR && x) x = sk_err_linux(x);   // its value is an errno too
++            if (level == SK_SOL_SOCKET && opt == SK_SO_TYPE) x = type;                   // the game's own (a bridge's local socket is a stream as well, but not by this rule)
++            if (v) memcpy(v, &x, cap < sizeof x ? cap : sizeof x);
++            if (n) *n = sizeof x;
++            return 0;
++        }
++    }
++    if (v && cap) memset(v, 0, cap);
++    unsigned got = sopt_kept(fd, level, opt, v, cap);
++    if (n) *n = got ? got : cap < 4 ? cap : 4;
++    return 0;
+ }
+ static int on_fcntl(int fd, int cmd, int val) {
+     if (on_host(fd, NULL, NULL, NULL, NULL) < 0) return -1;
+     BTRACE(fd, "socket %d: fcntl %d %#x", fd, cmd, val);
+     pthread_mutex_lock(&g_efd_m);
+     int r = 0;
+-    if (cmd == SK_F_GETFL) r = 2 | (g_efd[fd].nonblock ? SK_O_NONBLOCK : 0);   // O_RDWR
++    // O_RDWR, and the non-blocking bit where the game's library has it: 0x800 (Linux's O_NONBLOCK), not FreeBSD's 4. SM35 Recomp lists it among the fixes on its
++    // way to a played match, and Nextendo's own Ryujinx build and WindowSmash answer the same; a caller that reads the flags back to check, or to clear the bit, saw
++    // a blocking socket here before. F_SETFL still takes either bit
++    if (cmd == SK_F_GETFL) r = 2 | (g_efd[fd].nonblock ? SK_O_NONBLOCK_ALT : 0);
+     else if (cmd == SK_F_SETFL) g_efd[fd].nonblock = (val & (SK_O_NONBLOCK | SK_O_NONBLOCK_ALT)) != 0;
+     pthread_mutex_unlock(&g_efd_m);
+     return r;
+ }
+ // nn::socket::Ioctl. Horizon's requests are FreeBSD's: FIONBIO sets non-blocking from a 4-byte argument, FIONREAD reports what is
+-// readable. sm35recomp implements exactly these two (bsd_host.c); nothing here handled Ioctl at all, and Pia makes its UDP socket
+-// non-blocking this way rather than with Fcntl, so its NAT check got no usable socket. Any other request succeeds and changes nothing
++// readable. sm35recomp implements exactly these two (bsd_host.c). Super Smash Bros. Ultimate 13.0.5 does not import Ioctl at all (its
++// Pia goes through the typed Socket / Bind / SendTo / RecvFrom and takes non-blocking from the socket type or the message flag), so
++// this serves other games. Any other request succeeds and changes nothing
+ enum { SK_FIONBIO = 0x8004667e, SK_FIONREAD = 0x4004667f };
+ static int on_ioctl(int fd, uint32_t req, void *arg) {
+     int h = on_host(fd, NULL, NULL, NULL, NULL);
+@@ -704,7 +782,20 @@ static void obs_nex_login(uint64_t *regs, int param) {
+     NXLOG("NEX login through the bridge");
+     nx_account_ready(0);   // signs in now if needed, before the login asks for the ID token
+ }
+-__attribute__((constructor)) static void net_obs_init(void) { gate_obs_set(OBS_NEX_LOGIN, obs_nex_login); }
++// A Pia job that ends in failure (observation gate OBS_PIA_FAIL, the same patches.py): Pia keeps its own result codes, which never reach an
++// nn::err::ErrorResultVariant, so a failed NAT check or session join leaves no other trace than the game's own dialog. The function (main+0xb41f0 in
++// 13.0.5, WindowSmash's finding, runtime/hle_net.c) marks a job failed with the result [x1] points at; where it was called from names the job
++static void obs_pia_fail(uint64_t *regs, int param) {
++    (void)param;
++    if (!dm_net_online()) return;
++    static _Atomic int n;
++    if (atomic_fetch_add(&n, 1) >= 64) return;
++    uint32_t r = regs[1] > 0x10000 && !(regs[1] & 3) ? *(const uint32_t *)regs[1] : 0;   // (a reference: the function's first act is to copy what it points at)
++    const void *lr = (const void *)regs[30];
++    module_t *m = module_of(lr);
++    LOG("[nextendo] a Pia job failed: result %u (%#x), reported from %s+%#llx", r, r, m ? m->name : "?", m ? (unsigned long long)((const uint8_t *)lr - m->base) : (unsigned long long)regs[30]);
++}
++__attribute__((constructor)) static void net_obs_init(void) { gate_obs_set(OBS_NEX_LOGIN, obs_nex_login); gate_obs_set(OBS_PIA_FAIL, obs_pia_fail); }
+ 
+ SKF("_ZN2nn6socket6SocketENS0_6FamilyENS0_4TypeENS0_8ProtocolE", h_sk_Socket, int a, int b, int c) { if (dm_net_online()) return on_socket(a, b, c); return sk_fail(); }
+ SKF("_ZN2nn6socket4BindEiPKNS0_8SockAddrEj", h_sk_Bind, int s, const void *a, unsigned n) { if (dm_net_online()) return on_bind(s, a, n); return sk_fail(); }
+diff --git a/dm/host/hle_offline.c b/dm/host/hle_offline.c
+index 8425491..e642fd5 100644
+--- a/dm/host/hle_offline.c
++++ b/dm/host/hle_offline.c
+@@ -4,6 +4,7 @@
+ #include "hle.h"
+ #include "net_online.h"
+ #include <arpa/inet.h>
++#include <stdatomic.h>
+ int dm_net_sk_errno(void);   // hle_net.c: the online implementations of these calls
+ int dm_net_on_socket(int a, int b, int c); int dm_net_on_bind(int s, const void *a, unsigned n); int dm_net_on_connect(int s, const void *a, unsigned n);
+ int dm_net_on_listen(int s, int n); int dm_net_on_accept(int s, void *a, unsigned *n); int dm_net_on_name(int s, void *a, unsigned *n, int peer);
+@@ -193,7 +194,39 @@ HLE_FORCE("_ZN2nn3ngc46MaskProfanityWordsInTextForPlatformRegionChinaEPc", "Chin
+ 
+ // ---------- err: error display applet. Only logged, no UI is shown ----------
+ HLE_FORCE("_ZN2nn3err9ShowErrorENS0_9ErrorCodeE", "error display applet; the host only logs it", void, h_err_ShowCode, uint64_t code) { DM_APPLET("error"); LOG("game asks to show an error: %04u-%04u", (unsigned)(code & 0xffffffff), (unsigned)(code >> 32)); }
+-HLE_FORCE("_ZN2nn3err9ShowErrorERKNS0_18ErrorResultVariantE", "error display applet; the host only logs it", void, h_err_ShowVar, const void *v) { DM_APPLET("error"); (void)v; LOG("game asks to show an error (ErrorResultVariant)"); }
++// An ErrorResultVariant holds a Result or an ErrorCode: a state word, then the Result (one word) or the ErrorCode (category, number). State 1 is a Result (the SDK's
++// own assignment from a Result stores 1 and the Result: orr w8, wzr, #1; str w8, [x0]; ldr w8, [x1]; str w8, [x0, #4])
++static void err_variant_log(const char *what, const void *v) {
++    uint32_t w[3] = {0, 0, 0};
++    if (v) memcpy(w, v, sizeof w);
++    if (w[0] == 1) LOG("%s: result %#x = %04u-%04u", what, w[1], 2000 + (w[1] & 0x1ff), (w[1] >> 9) & 0x1fff);
++    else LOG("%s: state %u, %04u-%04u", what, w[0], w[1], w[2]);
++}
++HLE_FORCE("_ZN2nn3err9ShowErrorERKNS0_18ErrorResultVariantE", "error display applet; the host only logs it", void, h_err_ShowVar, const void *v) { DM_APPLET("error"); err_variant_log("game asks to show an error", v); }
++// Online, every failure the game records in an ErrorResultVariant is logged with its code (the game's own dialogs name none: "unstable network connection" is one
++// text for several causes). A Result carries modules up to 511 only; the online libraries' codes (2618-xxxx, 2306-xxxx) are ErrorCodes, so both forms are read. The
++// SDK's own function still does the work: the host only reads the argument on its way in. Offline nothing is logged
++static void *err_variant_pass(void *v, const uint32_t *a, const char *sym, void *(**orig)(void *, const uint32_t *), int *looked, int code) {
++    if (!*looked) { *orig = (void *(*)(void *, const uint32_t *))guest_sym(sym); *looked = 1; }
++    uint32_t w0 = a ? a[0] : 0, w1 = a && code ? a[1] : 0;
++    static _Atomic int n;
++    if ((w0 || w1) && dm_net_online() && atomic_fetch_add(&n, 1) < 200) {
++        if (code) LOG("[nextendo] the game records a failure: error code %04u-%04u", w0, w1);
++        else LOG("[nextendo] the game records a failure: result %#x = %04u-%04u", w0, 2000 + (w0 & 0x1ff), (w0 >> 9) & 0x1fff);
++    }
++    if (*orig) return (*orig)(v, a);
++    if (v) { uint32_t *o = v; o[0] = code ? 2 : 1; o[1] = w0; if (code) o[2] = w1; }   // (no definition to call: the Result form as above, the ErrorCode form by the next state)
++    return v;
++}
++#define ERR_VARIANT(sym, cname, code) \
++    HLE_FORCE(sym, "ErrorResultVariant from a Result or an ErrorCode: the SDK's own function runs; online the host logs the code", void *, cname, void *v, const uint32_t *a) { \
++        static void *(*orig)(void *, const uint32_t *); static int looked; return err_variant_pass(v, a, sym, &orig, &looked, code); }
++ERR_VARIANT("_ZN2nn3err18ErrorResultVariantC1ERKNS_6ResultE", h_err_VarC1, 0)
++ERR_VARIANT("_ZN2nn3err18ErrorResultVariantC2ERKNS_6ResultE", h_err_VarC2, 0)
++ERR_VARIANT("_ZN2nn3err18ErrorResultVariantaSERKNS_6ResultE", h_err_VarAssign, 0)
++ERR_VARIANT("_ZN2nn3err18ErrorResultVariantC1ERKNS0_9ErrorCodeE", h_err_VarCodeC1, 1)
++ERR_VARIANT("_ZN2nn3err18ErrorResultVariantC2ERKNS0_9ErrorCodeE", h_err_VarCodeC2, 1)
++ERR_VARIANT("_ZN2nn3err18ErrorResultVariantaSERKNS0_9ErrorCodeE", h_err_VarCodeAssign, 1)
+ HLE_FORCE("_ZN2nn3err40ShowUnacceptableAddOnContentVersionErrorEv", "add-on content version mismatch error applet; the host only logs it", void, h_err_AocVer, void) { DM_APPLET("error"); LOG("game asks to show an error: add-on content version mismatch"); }
+ HLE_FORCE("_ZN2nn3err39ShowUnacceptableApplicationVersionErrorEv", "game version mismatch error applet; the host only logs it", void, h_err_AppVer, void) { DM_APPLET("error"); LOG("game asks to show an error: game version mismatch"); }
+ // Pokémon Legends: Z-A (SDK 19): the application's own error screen (an error code number and two messages in the argument) goes through the error applet as well
+diff --git a/dm/host/net_nextendo_apple.m b/dm/host/net_nextendo_apple.m
+index bc48189..ed4904b 100644
+--- a/dm/host/net_nextendo_apple.m
++++ b/dm/host/net_nextendo_apple.m
+@@ -129,8 +129,11 @@ int nx_resolve(const char *name, uint32_t *ip) {
+     if (parse_ip(n, ip)) return 1;
+     if (!dm_net_online()) return 0;
+     if (!strcmp(n, "localhost")) { *ip = 0x7f000001; return 1; }
+-    size_t sl = strlen(".nintendo.net");
+-    if (len > sl && !strcmp(n + len - sl, ".nintendo.net")) {
++    // Nintendo's names, every domain of theirs Nextendo's own Ryujinx build sends to its servers (DnsMitmResolver.cs: nintendo.net, .com, .co.jp, nintendowifi.net)
++    static const char *const theirs[] = {".nintendo.net", ".nintendo.com", ".nintendowifi.net", ".nintendo.co.jp"};
++    int ours = 0;
++    for (size_t i = 0; i < sizeof theirs / sizeof *theirs && !ours; i++) { size_t sl = strlen(theirs[i]); ours = len > sl && !strcmp(n + len - sl, theirs[i]); }
++    if (ours) {
+         *ip = !strncmp(n, "nncs2", 5) ? C.nat : C.server;
+         NXLOG("name %s -> %s", n, *ip == C.nat ? "the NAT check" : "the game server");
+         return 1;
+@@ -600,7 +603,8 @@ static int trust_matches_pin(sec_trust_t trust) {
+     uint64_t sent, got;
+     NSMutableData *rhead;     // the server's HTTP head until its blank line
+     int rhead_done, nframes[2];
+-    struct { int have; uint8_t h[14]; uint64_t skip; } ws[2];   // 0: game → server, 1: server → game
++    struct { int have; uint8_t h[14]; uint64_t skip, len; int op, masked; uint8_t mask[4]; unsigned pos, capn; uint8_t cap[96]; } ws[2];   // 0: game → server, 1: server → game
++    int nnex, split[2];       // NEX calls logged so far; a split NEX message is passing in this direction
+     NSMutableData *cbody[2];  // a close frame's body while it passes
+     NSString *wsproto;        // the WebSocket subprotocol the game's request asks for ("NEX"); the server's answer must name it
+     NSString *wskey;          // the request's Sec-WebSocket-Key: the answer's Sec-WebSocket-Accept is checked against it
+@@ -651,7 +655,68 @@ static NSData *ws_fix_answer(NSData *head, NSString *proto) {
+     LOG("[nextendo] bridge: the server's answer names no WebSocket subprotocol: %s added, as the game asked", proto.UTF8String);
+     return [fixed dataUsingEncoding:NSISOLatin1StringEncoding];
+ }
+-// One direction's WebSocket frame headers, read as the bytes pass (payload bytes are skipped, never kept, except a close frame's)
++// DM_NEXTENDO_LOG: which NEX calls cross the bridge, from the first bytes of each binary frame. A frame is a PRUDP Lite packet (as Nextendo's server
++// writes it, nextendo-nex prudp_lite.go: 0x80, the options' length, the payload's (u16), the stream types, two ports, the fragment number, type | flags << 4
++// (u16), the sequence number (u16), the options, the payload), and a DATA packet's payload an RMC message (rmc.go: its length (u32), the protocol, with
++// bit 7 set on a call; then a call's id and method, or an answer's success byte and its id and method, or its result code and id). Lite's payload is in
++// the clear (TLS carries it). Only numbers are logged: the protocol, the method, the call's id, a failed call's result code, and of two NAT traversal calls
++// the figures the whole question is about (what the game reports of its NAT, and whether a hole punch worked). No station URL, token, name or id of a
++// player is read. Keep-alives and bare acknowledgements are left out
++static const char *nex_protocol(unsigned p) {
++    switch (p) {
++    case 0x03: return "NAT traversal"; case 0x0a: return "ticket granting"; case 0x0b: return "secure connection"; case 0x0e: return "notifications";
++    case 0x15: return "match making"; case 0x1b: return "message delivery"; case 0x32: return "match making (ext)"; case 0x6d: return "matchmake extension";
++    case 0x6e: return "utility"; case 0x70: return "ranking"; case 0x73: return "data store"; case 0x78: return "matchmake referee";
++    default: return "protocol";
++    }
++}
++static uint32_t le32(const uint8_t *b) { return (uint32_t)b[0] | (uint32_t)b[1] << 8 | (uint32_t)b[2] << 16 | (uint32_t)b[3] << 24; }
++// 1 when a line was written. b: the first n bytes of the frame's payload (unmasked), total: the payload's whole length. *split: a split message is passing
++static int nex_note(const uint8_t *b, unsigned n, uint64_t total, int dir, int *split, int quiet) {
++    const char *who = dir ? "server → game" : "game → server";
++    if (n < 12 || b[0] != 0x80) return 0;
++    unsigned optn = b[1], plen = b[2] | (unsigned)b[3] << 8, frag = b[7], tf = b[8] | (unsigned)b[9] << 8, type = tf & 15, flags = tf >> 4;
++    if (type != 2) {   // 0 SYN, 1 CONNECT, 3 DISCONNECT; 4 PING and Smash's keep-alive 8 are not worth a line
++        if (type == 4 || type == 8 || quiet) return 0;
++        NXLOG("NEX: %s %s%s", who, type == 0 ? "SYN" : type == 1 ? "CONNECT" : type == 3 ? "DISCONNECT" : "packet", flags & 1 ? " (acknowledged)" : "");
++        return 1;
++    }
++    if (!plen || (flags & 0x201)) return 0;                // an acknowledgement (bare, or a list of sequence numbers)
++    if (frag > 1) return 0;                                // a later piece of a split message
++    if (frag == 0 && *split) { *split = 0; return 0; }     // its last piece
++    if (frag == 1) *split = 1;                             // its first piece, which carries the head
++    if (12 + optn + 5 > n) return 0;
++    const uint8_t *m = b + 12 + optn; unsigned left = n - 12 - optn;
++    unsigned proto = m[4] & 0x7f, call = m[4] >> 7, at = 5;
++    if (proto == 0x7f) { if (left < 7) return 0; proto = m[5] | (unsigned)m[6] << 8; at = 7; }
++    if (call) {
++        if (left < at + 8) return 0;
++        uint32_t id = le32(m + at), method = le32(m + at + 4);
++        const uint8_t *body = m + at + 8; unsigned bl = left - at - 8;
++        if (proto == 3 && method == 5 && bl >= 12) {   // ReportNATProperties(mapping, filtering, round trip): what Pia's NAT check concluded
++            LOG("[nextendo] NEX: the game reports its NAT to the server: mapping %u, filtering %u, round trip %u ms (mapping: 1 the same port to every server, 2 a port per server, 0 not found out; filtering: 1 open, 2 by port, 0 not found out)", le32(body), le32(body + 4), le32(body + 8));
++            return 1;
++        }
++        if (proto == 3 && (method == 4 || method == 7) && bl >= (method == 7 ? 13u : 9u)) {   // ReportNATTraversalResult(station, ok, [detail,] round trip)
++            LOG("[nextendo] NEX: the game reports a hole punch to another player: %s, round trip %u ms", body[4] ? "it worked" : "FAILED", le32(body + (method == 7 ? 9 : 5)));
++            return 1;
++        }
++        if (quiet && proto != 3) return 0;
++        NXLOG("NEX: %s call %u: %s %#x method %u (%llu bytes)", who, id, nex_protocol(proto), proto, method, (unsigned long long)total);
++        return 1;
++    }
++    if (left < at + 1) return 0;
++    if (m[at]) {
++        if (left < at + 9 || (quiet && proto != 3)) return 0;
++        NXLOG("NEX: %s answer to call %u: %s %#x method %u (%llu bytes)", who, le32(m + at + 1), nex_protocol(proto), proto, le32(m + at + 5) & ~0x8000u, (unsigned long long)total);
++        return 1;
++    }
++    if (left < at + 9) return 0;
++    LOG("[nextendo] NEX: %s call %u FAILED: %s %#x, result %#x", who, le32(m + at + 5), nex_protocol(proto), proto, le32(m + at + 1));   // always logged
++    return 1;
++}
++// One direction's WebSocket frame headers, read as the bytes pass, and the first bytes of each binary frame for nex_note (the rest of a payload is skipped, never
++// kept, except a close frame's)
+ - (void)scan:(const uint8_t *)p n:(size_t)n dir:(int)dir {
+     if (!nx_log_on()) return;
+     typeof(ws[0]) *w = &ws[dir];
+@@ -660,7 +725,9 @@ static NSData *ws_fix_answer(NSData *head, NSString *proto) {
+         if (w->skip) {
+             size_t k = (size_t)(w->skip < n ? w->skip : n);
+             if (*cb && (*cb).length < 125) [*cb appendBytes:p length:MIN(k, 125 - (*cb).length)];
++            for (size_t i = 0; i < k && w->capn < sizeof w->cap; i++, w->pos++) w->cap[w->capn++] = p[i] ^ (w->masked ? w->mask[w->pos & 3] : 0);
+             p += k; n -= k; w->skip -= k;
++            if (!w->skip && w->op == 2) nnex += nex_note(w->cap, w->capn, w->len, dir, &split[dir], nnex >= 400);
+             if (!w->skip && *cb) {
+                 const uint8_t *b = (*cb).bytes; NSUInteger bl = (*cb).length;
+                 int code = bl >= 2 && dir == 1 ? b[0] << 8 | b[1] : -1;
+@@ -681,6 +748,8 @@ static NSData *ws_fix_answer(NSData *head, NSString *proto) {
+         if (nframes[dir]++ < 12 || op == 8) NXLOG("bridge: %s frame opcode %d, %llu bytes", dir ? "server → game" : "game → server", op, (unsigned long long)len);
+         *cb = op == 8 && dir == 1 ? [NSMutableData data] : nil;
+         if (op == 8 && dir == 0) NXLOG("bridge: the game sends a WebSocket close");
++        w->op = op; w->masked = masked; w->len = len; w->pos = 0; w->capn = 0;
++        if (masked) memcpy(w->mask, w->h + need - 4, 4);
+         w->skip = len; w->have = 0;
+         if (!len && *cb) { LOG("[nextendo] bridge: the server sends a WebSocket close (no code)"); *cb = nil; }
+     }
+diff --git a/dm/host/net_online.h b/dm/host/net_online.h
+index 6f94846..2a0f297 100644
+--- a/dm/host/net_online.h
++++ b/dm/host/net_online.h
+@@ -8,8 +8,8 @@
+ //             (net_nextendo_apple.m)
+ //   id token  the network service account ID token the game hands its NEX login: a JWT shaped like Nintendo BaaS's, carrying the Nextendo
+ //             PID as "sub" and the NEX login token as "nnex", which is what Nextendo's game server checks
+-//   names     every *.nintendo.net name the game resolves is Nextendo's: nncs2-* (Pia's second NAT check server) is their NAT check, every
+-//             other one their game server. Nothing else resolves
++//   names     every name of Nintendo's the game resolves (nintendo.net, .com, .co.jp, nintendowifi.net) is Nextendo's: nncs2-* (Pia's second
++//             NAT check server) is their NAT check, every other one their game server. Nothing else resolves
+ //   TLS       nn::ssl: a connection's handshake on a socket connected to the game server puts the bridge in the socket's place, so the game's
+ //             own TLS client (NEX over nn::ssl: Mario Kart 8 Deluxe) reads and writes plain bytes the bridge carries in TLS, the key pinned
+ //   NEX       (Super Smash Bros. Ultimate) the game's NEX client is pointed at a stand-in address (NX_BRIDGE_IP, observation gate OBS_NEX_LOGIN on its login job) where it
+@@ -24,7 +24,7 @@
+ //   DM_NEXTENDO_SERVER          the game server, a dotted IPv4 address[:port] (default NX_SERVER_DEFAULT:443)
+ //   DM_NEXTENDO_NAT             the NAT check server, a dotted IPv4 address (default NX_NAT_DEFAULT)
+ //   DM_NEXTENDO_PIN             the game server's public key: SHA-256 of its SubjectPublicKeyInfo, 64 hex digits (default NX_PIN_DEFAULT)
+-//   DM_NEXTENDO_LOG=1           log every socket, name and bridge event (the PID, tokens and codes are never logged)
++//   DM_NEXTENDO_LOG=1           log every socket, name and bridge event, the NEX calls by number and the failures the game records (the PID, tokens and codes are never logged)
+ //   DM_NEXTENDO_SIGNOUT=1       forget the stored account at start (the next online step asks to sign in again)
+ #pragma once
+ #include <stddef.h>
+diff --git a/docs/env_switches.tsv b/docs/env_switches.tsv
+index 7fed8c5..b5e34ce 100644
+--- a/docs/env_switches.tsv
++++ b/docs/env_switches.tsv
+@@ -119,7 +119,7 @@ DM_MSL_DIR	path	Parent folder of the shader libraries: NVN loads from `b-<chain
+ DM_NEXTENDO	switch	`1` takes a supported game (Super Smash Bros. Ultimate 13.0.5, Mario Kart 8 Deluxe 4.0.1) online through Nextendo Network, a community server: sockets, names, the account and the NEX login (docs/nextendo.md); the launcher's "Nextendo online" row sets it
+ DM_NEXTENDO_API	switch	The Nextendo account API (default `https://nextendo.network`); `http` only for a loopback test server
+ DM_NEXTENDO_CLIENT_ID	switch	The OAuth client ID of your application at nextendo.network/developers; without one the sign-in fails
+-DM_NEXTENDO_LOG	diagnostic	`1` logs every socket, name and bridge event of Nextendo online play (never the PID, tokens or codes)
++DM_NEXTENDO_LOG	diagnostic	`1` logs every socket, name and bridge event of Nextendo online play, the NEX calls by number and the failures the game records (never the PID, tokens or codes)
+ DM_NEXTENDO_NAT	switch	Nextendo's NAT check server, a dotted IPv4 address
+ DM_NEXTENDO_PIN	switch	The Nextendo game server's public key pin: SHA-256 of its SubjectPublicKeyInfo, 64 hex digits
+ DM_NEXTENDO_REDIRECT_PORT	switch	The loopback port of the sign-in redirect your Nextendo application registers, `http://127.0.0.1:<port>/callback` (default `47823`)
+diff --git a/docs/nextendo.md b/docs/nextendo.md
+index 3c8da5b..741b016 100644
+--- a/docs/nextendo.md
++++ b/docs/nextendo.md
+@@ -20,14 +20,15 @@ runs offline exactly as before.
+ 
+ | Piece | Where | What it does |
+ |---|---|---|
+-| Switches, names | `dm/host/net_nextendo_apple.m` | `DM_NEXTENDO*`; every `*.nintendo.net` name resolves to Nextendo's game server (`nncs2-*` to their NAT check), nothing else resolves |
++| Switches, names | `dm/host/net_nextendo_apple.m` | `DM_NEXTENDO*`; every name under `nintendo.net`, `nintendo.com`, `nintendo.co.jp` and `nintendowifi.net` resolves to Nextendo's game server (`nncs2-*` to their NAT check), as Nextendo's own Ryujinx build redirects them; nothing else resolves |
+ | Account | `net_nextendo_apple.m` | OAuth 2.0 authorization code + PKCE in an in-app sheet (iPhone) or the browser (Mac), redirect caught on `127.0.0.1`; refresh token in the Keychain; `GET /api/nex-token` gives the NEX login token and the PID |
+ | ID token | `net_nextendo_apple.m`, `hle_account.c` | the network service account's ID token: a JWT shaped like Nintendo BaaS's with the PID as `sub` and the NEX token as `nnex` |
+-| Sockets | `dm/host/hle_net.c`, `hle_offline.c` | `nn::socket` on the host's BSD sockets (non-blocking at the host; the game's blocking calls wait in slices). TCP reaches Nextendo only, UDP any address (Pia's peers) |
++| Sockets | `dm/host/hle_net.c`, `hle_offline.c` | `nn::socket` on the host's BSD sockets (non-blocking at the host; the game's blocking calls wait in slices). TCP reaches Nextendo only, UDP any address (Pia's peers). Errnos and `O_NONBLOCK` (0x800) are Linux's, as the console's library has them; only the socket options whose number means the same on Horizon and on Apple's kernel reach the host socket, the others are kept and read back as set |
+ | nifm | `hle_net.c`, `hle_offline.c` | the network is available; the IP configuration is the host's |
+ | NEX login | `dm/games/01006A800016E000/patches.py`, `hle_net.c` | gate `OBS_NEX_LOGIN` on the login job gives NEX's NgsFacade a direct server address, `10.13.37.1:443`, where NEX speaks its WebSocket without TLS |
+ | nn::ssl | `hle_net.c` | a connection's handshake on a socket connected to the game server swaps the bridge in for that socket, with the host name the game set; Read, Write, Peek and Poll are then the socket's. This is how Mario Kart 8 Deluxe's NEX client logs in, with no patch of the game |
+ | TLS bridge | `net_nextendo_apple.m` | a TCP connection to `10.13.37.1` is a local socket whose other end goes to the game server in TLS (Network.framework), the server's key pinned, the `Host` header rewritten |
++| Diagnostics | `net_nextendo_apple.m`, `hle_net.c`, `hle_offline.c`, the game's `patches.py` | with `DM_NEXTENDO_LOG=1`: each NEX call that crosses the bridge by protocol and method number, a failed call's result code, what the game reports of its NAT and of each hole punch; every datagram socket's totals at its close and the NAT check's probes and replies; every failure the game records in an `ErrorResultVariant`; and gate `OBS_PIA_FAIL` (Smash 13.0.5) logs each Pia job that fails with its result. No station URL, token, name or player id is read |
+ 
+ ## Mario Kart 8 Deluxe
+ 
+@@ -38,6 +39,6 @@ the lobby, and whether Nextendo expects anything of the ID token beyond what Sma
+ ## Known gaps
+ 
+ - Friends, presence, play reports and BCAT stay cut, and `nn::ssl`'s certificate calls answer without doing anything (the bridge's pin is the check). If Smash needs one of them before it reaches the Online menu, that hook is the next piece of work.
+-- The login gate's offset and the facade layout are for `main` 21450c64… (13.0.5) only.
++- The login gate's and the Pia failure gate's offsets and the facade layout are for `main` 21450c64… (13.0.5) only.
+ - Pia's NAT traversal runs on the host's UDP sockets unchanged; a network that blocks peer-to-peer UDP (some mobile networks) will not reach matches.
+ - Tokens, codes and the PID are never logged. The players in a match learn each other's IP address, as on a console.
