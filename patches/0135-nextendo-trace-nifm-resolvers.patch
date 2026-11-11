@@ -1,0 +1,116 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: yewsifofficial <yewsifofficial@gmail.com>
+Date: Wed, 11 Nov 2026 00:46:05 -0500
+Subject: [PATCH] net: trace what nifm reports, and which resolver the game
+ calls
+
+The game's own symbols settle two questions. It imports no Ioctl at all, so
+the three guessed Ioctl hooks of the last round were wrong and are left as
+they are (unreferenced, costing nothing): every socket call main imports is
+hooked, bar the pure Inet* converters, which need no host. And there are no
+Pia symbols anywhere: Pia is linked into main, so its socket calls do reach
+these hooks, which makes "UDP created, closed, nothing between" Pia's own
+decision rather than a missed call.
+
+What Pia depends on besides sockets is nifm, which was never traced: the
+address and IP configuration this host reports are now logged. The resolvers
+are tagged too, since the name one of them keeps receiving is pointer-like
+bytes rather than text, which would mean that hook's signature is not the one
+the game calls; when the name is not printable its arguments are dumped.
+Diagnostic only.
+
+Upstream-Status: fork-only (online play is out of nxnative's scope)
+Reason: Pia NAT traversal for Super Smash Bros. Ultimate on Nextendo
+Issue: TODO
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_017xdHQoEipBX2wTqN8BNnMv
+---
+ dm/host/hle_net.c     | 30 +++++++++++++++++++++++++++---
+ dm/host/hle_offline.c |  1 +
+ 2 files changed, 28 insertions(+), 3 deletions(-)
+
+diff --git a/dm/host/hle_net.c b/dm/host/hle_net.c
+index 30c7b54..c8b35aa 100644
+--- a/dm/host/hle_net.c
++++ b/dm/host/hle_net.c
+@@ -43,6 +43,7 @@ HLE_FORCE("_ZN2nn4nifm31HandleNetworkRequestErrorResultEv", "offline: not resolv
+ HLE_FORCE("_ZN2nn4nifm26GetCurrentPrimaryIpAddressEPNS_6socket6InAddrE", "offline: no IP (online: the host's address on its default route)", Result, h_nifm_GetIp, uint32_t *a) {
+     uint32_t ip = dm_net_online() ? nx_local_ip() : 0;
+     if (a) *a = htonl(ip);
++    NXLOG("nifm: the game asks for our address -> %u.%u.%u.%u%s", ip >> 24, ip >> 16 & 255, ip >> 8 & 255, ip & 255, ip ? "" : " (none: reported as a failure)");
+     return ip ? RES_OK : RES_FAIL;
+ }
+ HLE_FORCE("_ZN2nn4nifm22GetCurrentProxySettingEPNS0_12ProxySettingE", "offline: no proxy setting", Result, h_nifm_GetProxy, void *p) { (void)p; return RES_FAIL; }
+@@ -618,6 +619,29 @@ static int on_getaddrinfo(const char *host, const char *serv, const void *hint,
+     if (res) *res = ai; else free(ai);
+     return 0;
+ }
++// DM_NEXTENDO_LOG: which resolver the game called, and when its "name" is not printable, the arguments as well. A name that comes
++// through as pointer-like bytes means this hook's signature does not match the one the game calls, and the real name is elsewhere
++static int name_is_text(const char *n) {
++    if (!n) return 0;
++    for (size_t i = 0; i < 64; i++) {
++        if (!n[i]) return i > 0;
++        if (n[i] < 32 || n[i] > 126) return 0;
++    }
++    return 1;
++}
++static void resolver_called(const char *who, const char *n, const void *a2, const void *a3) {
++    if (!nx_log_on()) return;
++    if (name_is_text(n)) { NXLOG("%s(\"%s\")", who, n); return; }
++    NXLOG("%s: the name argument is not text (%p); second %p, third %p", who, (const void *)n, a2, a3);
++    const void *const args[3] = {n, a2, a3};
++    for (int i = 0; i < 3; i++) {
++        const char *p = (const char *)args[i];
++        if (!p) continue;
++        if (name_is_text(p)) { NXLOG("  argument %d points at the text \"%s\"", i + 1, p); continue; }
++        const unsigned char *b = (const unsigned char *)p;
++        NXLOG("  argument %d points at bytes %02x %02x %02x %02x %02x %02x %02x %02x", i + 1, b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]);
++    }
++}
+ typedef struct { char *name; char **aliases; int32_t addrtype, length; char **addr_list; } sk_hostent;
+ static void *on_gethostbyname(const char *name) {
+     static __thread struct { sk_hostent he; char *alias0, *list[2]; uint32_t addr; char name[256]; } t;
+@@ -682,7 +706,7 @@ SKF("_ZN2nn6socket11GetPeerNameEiP8sockaddrPj", h_sk_GetPeerName21, int s, void
+ SKF("_ZN2nn6socket8ShutdownEiNS0_14ShutdownMethodE", h_sk_Shutdown21, int s, int how) { if (dm_net_online()) return on_shutdown(s, how); return sk_fail(); }
+ HLE_FORCE("_ZN2nn6socket4ReadEiPvm", "bsd socket service (cut)", long, h_sk_Read, int s, void *b, unsigned long n) { if (dm_net_online()) return on_recv(s, b, n, 0, NULL, NULL); return sk_fail(); }
+ HLE_FORCE("_ZN2nn6socket5WriteEiPKvm", "bsd socket service (cut)", long, h_sk_Write, int s, const void *b, unsigned long n) { if (dm_net_online()) return on_send(s, b, n, 0, NULL, 0); return sk_fail(); }
+-HLE_FORCE("_ZN2nn6socket16GetHostEntByNameEPKc", "name resolution (cut): NULL", void *, h_sk_GetHostEnt21, const char *n) { if (dm_net_online()) return on_gethostbyname(n); t_skerr = SK_ENETDOWN; return NULL; }
++HLE_FORCE("_ZN2nn6socket16GetHostEntByNameEPKc", "name resolution (cut): NULL", void *, h_sk_GetHostEnt21, const char *n) { if (dm_net_online()) { resolver_called("GetHostEntByName", n, NULL, NULL); return on_gethostbyname(n); } t_skerr = SK_ENETDOWN; return NULL; }
+ HLE_FORCE("_ZN2nn6socket12SetAllocatorEPNS_14MemoryResourceE", "socket library allocator; no session is created, ignored", void, h_sk_SetAlloc, void *r) { (void)r; }
+ SKF("_ZN2nn6socket4PollEPNS0_6PollFdEmi", h_sk_Poll, void *f, unsigned long n, int t) { if (dm_net_online()) return on_poll(f, n, t); return dm_sk_poll(f, n, t); }
+ // The C library's poll (SDK 21's nnmusl, Star Fox): it needs the socket state of the initialization cut above and fails with EFAULT without it, which the game's loop takes as fatal, so it goes
+@@ -702,7 +726,7 @@ HLE_FORCE("_ZN2nn6socket11GetAddrInfoEPKcS2_PKNS0_8AddrInfoEPPS3_", "name resolu
+     (void)h; (void)s; (void)hint; if (res) *res = NULL; return 4;   // EAI_FAIL
+ }
+ HLE_FORCE("_ZN2nn6socket12FreeAddrInfoEPNS0_8AddrInfoE", "pairs with GetAddrInfo (cut)", void, h_sk_FreeAddrInfo, void *ai) { if (dm_net_online()) free(ai); }
+-HLE_FORCE("_ZN2nn6socket16GetHostEntByNameEPKcPKNS0_14ResolverOptionEm", "name resolution (cut): NULL", void *, h_sk_GetHostEnt, const char *n, const void *o, unsigned long c) { (void)o; (void)c; if (dm_net_online()) return on_gethostbyname(n); t_skerr = SK_ENETDOWN; return NULL; }
++HLE_FORCE("_ZN2nn6socket16GetHostEntByNameEPKcPKNS0_14ResolverOptionEm", "name resolution (cut): NULL", void *, h_sk_GetHostEnt, const char *n, const void *o, unsigned long c) { if (dm_net_online()) { resolver_called("GetHostEntByName with options", n, o, (const void *)c); return on_gethostbyname(n); } t_skerr = SK_ENETDOWN; return NULL; }
+ HLE_FORCE("_ZN2nn6socket12GetLastErrorEv", "socket error code kept by the host", int, h_sk_GetLastError, void) { return t_skerr; }
+ // C interface
+ SKF("nnsocketSocket", h_nsk_Socket, int a, int b, int c) { if (dm_net_online()) return on_socket(a, b, c); return sk_fail(); }
+@@ -719,7 +743,7 @@ SKF("nnsocketResolverGetOption", h_nsk_ResGet, void *o, int k) { (void)o; (void)
+ SKF("nnsocketResolverSetOption", h_nsk_ResSet, const void *o) { (void)o; return sk_fail(); }
+ HLE_FORCE("nnsocketRecv", "bsd socket service (cut)", long, h_nsk_Recv, int s, void *b, unsigned long n, int f) { if (dm_net_online()) return on_recv(s, b, n, f, NULL, NULL); return sk_fail(); }
+ HLE_FORCE("nnsocketSend", "bsd socket service (cut)", long, h_nsk_Send, int s, const void *b, unsigned long n, int f) { if (dm_net_online()) return on_send(s, b, n, f, NULL, 0); return sk_fail(); }
+-HLE_FORCE("nnsocketGetHostByNameWithOptions", "name resolution (cut): NULL", void *, h_nsk_GetHost, const char *n, const void *o, unsigned long c) { (void)o; (void)c; if (dm_net_online()) return on_gethostbyname(n); t_skerr = SK_ENETDOWN; return NULL; }
++HLE_FORCE("nnsocketGetHostByNameWithOptions", "name resolution (cut): NULL", void *, h_nsk_GetHost, const char *n, const void *o, unsigned long c) { if (dm_net_online()) { resolver_called("nnsocketGetHostByNameWithOptions", n, o, (const void *)c); return on_gethostbyname(n); } t_skerr = SK_ENETDOWN; return NULL; }
+ HLE_FORCE("nnsocketGetLastErrno", "socket error code kept by the host", int, h_nsk_GetErrno, void) { return t_skerr; }
+ HLE_FORCE("nnsocketSetLastErrno", "socket error code kept by the host", void, h_nsk_SetErrno, int e) { t_skerr = e; }
+ 
+diff --git a/dm/host/hle_offline.c b/dm/host/hle_offline.c
+index e899449..8425491 100644
+--- a/dm/host/hle_offline.c
++++ b/dm/host/hle_offline.c
+@@ -141,6 +141,7 @@ HLE_FORCE("_ZN2nn3ssl14BuiltInManager22GetBuiltInCertificatesEPPNS0_26BuiltInCer
+ // names are the host's, hle_net.c). All in network order
+ static int net_ip_config(uint32_t *ip, uint32_t *mask, uint32_t *gw, uint32_t *dns1, uint32_t *dns2) {
+     uint32_t a = nx_local_ip();
++    NXLOG("nifm: the game asks for the IP configuration -> %u.%u.%u.%u%s", a >> 24, a >> 16 & 255, a >> 8 & 255, a & 255, a ? "" : " (none: reported as a failure)");
+     if (!a) return 0;
+     if (ip) *ip = htonl(a);
+     if (mask) *mask = htonl(0xffffff00u);
+-- 
+2.43.0
+

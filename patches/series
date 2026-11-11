@@ -97,3 +97,4 @@
 0132-nextendo-udp-park-and-trace.patch
 0133-nextendo-trace-pia.patch
 0134-nextendo-socket-ioctl.patch
+0135-nextendo-trace-nifm-resolvers.patch

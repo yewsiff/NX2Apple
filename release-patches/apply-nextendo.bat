@@ -21,6 +21,7 @@ call :one nextendo-secure-for-v1.3.0 uint16_t dm\host\net_online.h || exit /b 1
 call :one nextendo-udp-for-v1.3.0 park_take dm\host\hle_net.c || exit /b 1
 call :one nextendo-piatrace-for-v1.3.0 rawn dm\host\net_nextendo_apple.m || exit /b 1
 call :one nextendo-ioctl-for-v1.3.0 on_ioctl dm\host\hle_net.c || exit /b 1
+call :one nextendo-nifmtrace-for-v1.3.0 resolver_called dm\host\hle_net.c || exit /b 1
 echo.
 echo All Nextendo patches are in. Rebuild the game in the launcher.
 exit /b 0
