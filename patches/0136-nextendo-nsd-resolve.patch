@@ -1,0 +1,143 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: yewsifofficial <yewsifofficial@gmail.com>
+Date: Wed, 11 Nov 2026 03:47:37 -0500
+Subject: [PATCH] nsd: answer Resolve and ResolveEx online; a trace budget of
+ its own for UDP
+
+Every match attempt in the device logs starts with the game resolving a
+"name" of a few pointer-like bytes, then fails with "unstable network
+connection". nn::nsd::Resolve and ResolveEx were cut here: a failure with
+the output Fqdn left as it was, and Smash resolves the answer without
+looking at the result, so it resolved what its buffer happened to hold.
+Both references answer it: sm35recomp at the service (services/names.c: the
+name with '%' as the environment, lp1) and WindowSmash for this very game
+(hle_env.c: ResolveEx copies the name through and succeeds). Online they now
+return the name with its environment filled in.
+
+The trace had one budget of 240 lines, and the login and the secure
+connection's chatter used all of it before the first UDP socket: the last
+traced line of the last log is 59 lines before "UDP created". Everything
+read off that silence was wrong, including the Ioctl hooks of two rounds ago
+(the game imports no Ioctl). Datagram sockets have a budget of their own
+now, and 16-byte datagrams to and from ports 10025 and 10125 are decoded as
+the NAT check's probes and replies, as Nextendo's responder documents them
+(nextendo-nncs, main.go).
+
+Upstream-Status: fork-only (online play is out of nxnative's scope)
+Reason: Nextendo online play for Super Smash Bros. Ultimate
+Issue: TODO
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_017xdHQoEipBX2wTqN8BNnMv
+---
+ dm/host/hle_misc.c | 29 +++++++++++++++++++++++++++--
+ dm/host/hle_net.c  | 24 ++++++++++++++++++++----
+ 2 files changed, 47 insertions(+), 6 deletions(-)
+
+diff --git a/dm/host/hle_misc.c b/dm/host/hle_misc.c
+index f38ca60..9e9c138 100644
+--- a/dm/host/hle_misc.c
++++ b/dm/host/hle_misc.c
+@@ -1,6 +1,7 @@
+ // Miscellaneous service layer: add-on content / shop / error applet / profanity filter / server name resolution / parental controls / software keyboard.
+ // On the real device each goes through IPC or a system applet; the host gives results as single-player offline. Pure-computation SDK parts (hash, util, software Opus) are not taken over, the original implementation is used directly.
+ #include "hle.h"
++#include "net_online.h"
+ #include <dirent.h>
+ 
+ // ---------- aoc add-on content (the DLC NSPs in the player's folder) / ec shop (excluded) ----------
+@@ -173,8 +174,32 @@ HLE_FORCE("_ZN2nn3ngc15ProfanityFilter11SetMaskModeENS1_8MaskModeE", "profanity
+ HLE_FORCE("_ZN2nn3ngc15ProfanityFilter8FinalizeEv", "profanity filter shutdown; the host mounted no word list", void, h_ngc_Fini, void *self) { (void)self; }
+ 
+ // ---------- nsd server name resolution / pctl free communication: networking, out of scope ----------
+-HLE_FORCE("_ZN2nn3nsd7ResolveEPNS0_4FqdnERKS1_", "server name resolution, networking out of scope; cut", Result, h_nsd_Resolve, void *out, const void *in) { (void)out; (void)in; return RES_FAIL; }
+-HLE_FORCE("_ZN2nn3nsd9ResolveExEPNS0_4FqdnERKS1_", "server name resolution, networking out of scope; cut", Result, h_nsd_ResolveEx, void *out, const void *in) { (void)out; (void)in; return RES_FAIL; }
++// Online (net_online.h): nsd's answer is the name with the environment filled in, '%' as "lp1" (an Fqdn is 0x100 bytes of text). The cut
++// returned a failure and left the output as it was, and a game that resolves the answer without looking at the result then resolves
++// whatever its buffer held: Smash did exactly that at the start of each match attempt, logged as a name of a few pointer-like bytes.
++// sm35recomp answers the same way at the service (services/names.c), and WindowSmash for this game's ResolveEx (hle_env.c)
++static Result nsd_resolve_online(void *out, const void *in) {
++    if (!out || !in) return RES_FAIL;
++    char name[0x100], full[0x100];
++    memcpy(name, in, sizeof name); name[sizeof name - 1] = 0;   // (a copy first: the two may be the same buffer)
++    size_t o = 0;
++    for (size_t i = 0; name[i] && o + 1 < sizeof full; i++) {
++        if (name[i] == '%') { for (const char *e = "lp1"; *e && o + 1 < sizeof full; e++) full[o++] = *e; }
++        else full[o++] = name[i];
++    }
++    memset(full + o, 0, sizeof full - o);
++    memcpy(out, full, sizeof full);
++    NXLOG("nsd: \"%s\" -> \"%s\"", name, full);
++    return RES_OK;
++}
++HLE_FORCE("_ZN2nn3nsd7ResolveEPNS0_4FqdnERKS1_", "server name resolution, networking out of scope; cut (online: the name, its environment filled in)", Result, h_nsd_Resolve, void *out, const void *in) {
++    if (dm_net_online()) return nsd_resolve_online(out, in);
++    return RES_FAIL;
++}
++HLE_FORCE("_ZN2nn3nsd9ResolveExEPNS0_4FqdnERKS1_", "server name resolution, networking out of scope; cut (online: the name, its environment filled in)", Result, h_nsd_ResolveEx, void *out, const void *in) {
++    if (dm_net_online()) return nsd_resolve_online(out, in);
++    return RES_FAIL;
++}
+ // bool arguments only look at the low 8 bits; returns bool
+ // The permission query answers as TryBegin / IsFreeCommunicationAvailable do: the SDK's version calls the pctl service (pctl::detail::ipc::GetService), which the host never opens (DRAGON QUEST XI S imports it; from PR #38)
+ HLE_FORCE("_ZN2nn4pctl32CheckFreeCommunicationPermissionEb", "parental controls · permission to communicate with others, networking out of scope; never, no system UI", unsigned, h_pctl_CheckFree, unsigned show_ui) { (void)show_ui; return 0; }
+diff --git a/dm/host/hle_net.c b/dm/host/hle_net.c
+index c8b35aa..40f6702 100644
+--- a/dm/host/hle_net.c
++++ b/dm/host/hle_net.c
+@@ -241,9 +241,12 @@ static int sk_err_linux(int e) {
+ }
+ static int on_err(int e) { t_skerr = sk_err_linux(e); return -1; }
+ // DM_NEXTENDO_LOG: the game's calls on a bridge socket (the first ones of each kind), to see what it does with the server's answer
+-static _Atomic int g_trace_n;
++static _Atomic int g_trace_n, g_trace_udp;
+ static int bridge_fd(int fd);
+-#define BTRACE(fd, ...) do { if (nx_log_on() && atomic_fetch_add(&g_trace_n, 1) < 240) NXLOG(__VA_ARGS__); } while (0)
++// Two budgets: the login and the secure connection's chatter used all of the one there was (240 lines) before the first UDP socket,
++// so nothing a datagram socket did was ever logged, and "created, closed, nothing between" was read off a trace that had ended
++static int sk_is_udp(int fd);
++#define BTRACE(fd, ...) do { if (nx_log_on() && (sk_is_udp(fd) ? atomic_fetch_add(&g_trace_udp, 1) < 600 : atomic_fetch_add(&g_trace_n, 1) < 240)) NXLOG(__VA_ARGS__); } while (0)
+ static const char *ip_str(uint32_t ip_net, uint16_t port_net, char out[24]) {   // "a.b.c.d:p" (network order in)
+     uint32_t a = ntohl(ip_net);
+     snprintf(out, 24, "%u.%u.%u.%u:%u", a >> 24, a >> 16 & 255, a >> 8 & 255, a & 255, ntohs(port_net));
+@@ -279,6 +282,19 @@ static int on_host(int fd, int *nb, int *type, int64_t *rcv, int64_t *snd) {   /
+     return h;
+ }
+ // Waits until the host socket has one of events, up to ms (< 0: no bound). 1 ready, 0 timed out, -1 the host is shutting the game down
++static int sk_is_udp(int fd) { pthread_mutex_lock(&g_efd_m); int u = sk_used(fd) && g_efd[fd].type == SK_SOCK_DGRAM; pthread_mutex_unlock(&g_efd_m); return u; }
++// A 16-byte datagram to or from a NAT check server, as Nextendo's responder documents it (nextendo-nncs, main.go): four big-endian
++// words, a probe {test id, -, -, local IP} and its reply {test id, the port and the address the server saw us from, the server's}
++static void nat_note(const char *what, const void *b, long n, uint32_t ip_net, uint16_t port_net) {
++    uint16_t port = ntohs(port_net);
++    if (!nx_log_on() || n != 16 || (port != 10025 && port != 10125)) return;
++    const uint8_t *p = b;
++    uint32_t w[4];
++    for (int i = 0; i < 4; i++) w[i] = (uint32_t)p[4 * i] << 24 | (uint32_t)p[4 * i + 1] << 16 | (uint32_t)p[4 * i + 2] << 8 | p[4 * i + 3];
++    char d[24];
++    if (*what == 'p') NXLOG("NAT check: probe %u to %s (our address in it %u.%u.%u.%u)", w[0], ip_str(ip_net, port_net, d), w[3] >> 24, w[3] >> 16 & 255, w[3] >> 8 & 255, w[3] & 255);
++    else NXLOG("NAT check: reply %u from %s: it saw us as %u.%u.%u.%u:%u", w[0], ip_str(ip_net, port_net, d), w[2] >> 24, w[2] >> 16 & 255, w[2] >> 8 & 255, w[2] & 255, w[1]);
++}
+ static int bridge_fd(int fd) { pthread_mutex_lock(&g_efd_m); int b = sk_used(fd) && g_efd[fd].bridge; pthread_mutex_unlock(&g_efd_m); return b; }
+ static int on_wait(int h, short events, int64_t ms) {
+     uint64_t start = now_ns();
+@@ -437,7 +453,7 @@ static long on_recv(int fd, void *b, unsigned long len, int flags, void *a, unsi
+     for (;;) {
+         struct sockaddr_in in; socklen_t il = sizeof in;
+         ssize_t r = recvfrom(h, b, len, flags, a ? (struct sockaddr *)&in : NULL, a ? &il : NULL);
+-        if (r >= 0 && a && type == SK_SOCK_DGRAM) { char d[24]; BTRACE(fd, "socket %d: recvfrom -> %ld from %s", fd, (long)r, ip_str(in.sin_addr.s_addr, in.sin_port, d)); }
++        if (r >= 0 && a && type == SK_SOCK_DGRAM) { char d[24]; BTRACE(fd, "socket %d: recvfrom -> %ld from %s", fd, (long)r, ip_str(in.sin_addr.s_addr, in.sin_port, d)); nat_note("reply", b, (long)r, in.sin_addr.s_addr, in.sin_port); }
+         else BTRACE(fd, "socket %d: recv up to %lu (flags %#x%s) -> %ld%s%s", fd, len, flags, nb ? ", non-blocking" : "", (long)r, r < 0 ? ", errno " : "", r < 0 ? strerror(errno) : "");
+         if (r >= 0) {
+             if (a && al) { pthread_mutex_lock(&g_efd_m); int br = sk_used(fd) && g_efd[fd].bridge; pthread_mutex_unlock(&g_efd_m);
+@@ -463,7 +479,7 @@ static long on_send(int fd, const void *b, unsigned long len, int flags, const v
+     }
+     for (;;) {
+         ssize_t r = to ? sendto(h, b, len, flags, (struct sockaddr *)&in, sizeof in) : send(h, b, len, flags);
+-        if (to) { char d[24]; BTRACE(fd, "socket %d: sendto %lu -> %ld, %s%s%s", fd, len, (long)r, ip_str(in.sin_addr.s_addr, in.sin_port, d), r < 0 ? ", errno " : "", r < 0 ? strerror(errno) : ""); }
++        if (to) { char d[24]; BTRACE(fd, "socket %d: sendto %lu -> %ld, %s%s%s", fd, len, (long)r, ip_str(in.sin_addr.s_addr, in.sin_port, d), r < 0 ? ", errno " : "", r < 0 ? strerror(errno) : ""); nat_note("probe", b, (long)len, in.sin_addr.s_addr, in.sin_port); }
+         else BTRACE(fd, "socket %d: send %lu -> %ld%s%s", fd, len, (long)r, r < 0 ? ", errno " : "", r < 0 ? strerror(errno) : "");
+         if (r >= 0) return r;
+         if (errno != EAGAIN || nb) return on_err(errno);
+-- 
+2.43.0
+
