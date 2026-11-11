@@ -1,0 +1,268 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: yewsifofficial <yewsifofficial@gmail.com>
+Date: Wed, 11 Nov 2026 17:56:19 -0500
+Subject: [PATCH] net: make the log comparable with the working client's, and
+ allow a pin per backend
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+A Ryujinx-Nextendo log of the same two actions that fail here — joining an
+arena, then Quickplay — both of which worked, says what the sequence should
+be. Per action:
+
+  nifm GetCurrentNetworkProfile
+  resolve api-lp1.znc.srv.nintendo.net   (GetHostByName)
+  TCP/443, ssl SetHostName api-lp1.znc.srv.nintendo.net, handshake, close
+  resolve nncs1-lp1.n.n.srv.nintendo.net, nncs2-lp1...  (GetAddrInfo)
+  UDP bind 57998  -> closed 1.37 s later
+  UDP bind 59281  -> closed 1.33 s later
+  UDP bind 59281  -> the parked socket of that port -> 16 s -> closed
+
+Two things in our last log stand against it. The game never resolves
+api-lp1.znc.srv.nintendo.net at all; where that call belongs it resolves a
+five-byte "name" instead, which is the nsd::Resolve cut that patch 0136
+fixes and which has not been tested yet. And its third UDP socket closes
+within a frame of being made, where the working client's third socket takes
+the second's port and lives for the match — which is what parking is for, so
+whether our ports line up with each other is the question the next log has
+to answer.
+
+So the lines this fork prints for the UDP phase now match the shapes above:
+a datagram socket's bind and its adoption of a parked port are logged
+whatever the trace budget, as its totals at close already were. And a run of
+would-block results is logged once instead of every time: the NEX client
+polls and reads in a tight loop through each handshake, and those lines used
+the whole budget before the match attempt in every log so far, which is what
+made the last one unreadable.
+
+DM_NEXTENDO_PIN takes several pins, commas between them, and a key that is
+not pinned is refused with its own hash logged. Their router fronts more
+than the game server — the trace above shows the account API behind the same
+address — and a backend of theirs need not share the game server's key; one
+pin would refuse it with nothing to go on.
+
+Upstream-Status: fork-only (online play is out of nxnative's scope)
+Reason: Nextendo online play for Super Smash Bros. Ultimate
+Issue: yewsiff/NX2Apple (no tracker: issues are disabled on this fork)
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_017xdHQoEipBX2wTqN8BNnMv
+---
+ dm/host/hle_net.c            | 25 ++++++++++++++++-----
+ dm/host/net_nextendo_apple.m | 42 +++++++++++++++++++++++++++++-------
+ dm/host/net_online.h         |  5 ++++-
+ docs/env_switches.tsv        |  2 +-
+ docs/nextendo.md             |  2 +-
+ 5 files changed, 60 insertions(+), 16 deletions(-)
+
+diff --git a/dm/host/hle_net.c b/dm/host/hle_net.c
+index 29c9a1a..574d397 100644
+--- a/dm/host/hle_net.c
++++ b/dm/host/hle_net.c
+@@ -74,7 +74,7 @@ enum { EFD_MAX = 64, SK_POLLIN = 1, SK_POLLOUT = 4, SK_POLLRDNORM = 0x40, SK_POL
+ // One table for every descriptor the host hands out, so their numbers never clash: an event descriptor (host < 0), or online a socket (host is the
+ // host's own socket, always non-blocking at the host; nonblock is the game's own setting). Online, an event descriptor also has a pipe that holds
+ // one byte while its count is not zero (pr / pw), so a host poll can wait on it beside the sockets
+-static struct { uint64_t count; int used, flags; int host, pr, pw, type, nonblock, bridge, bport; int64_t rcv_ms, snd_ms; uint32_t ntx, nrx, nfail; } g_efd[EFD_MAX];
++static struct { uint64_t count; int used, flags; int host, pr, pw, type, nonblock, bridge, bport; int64_t rcv_ms, snd_ms; uint32_t ntx, nrx, nfail; int wb; } g_efd[EFD_MAX];
+ static pthread_mutex_t g_efd_m = PTHREAD_MUTEX_INITIALIZER;
+ static pthread_cond_t g_efd_c = PTHREAD_COND_INITIALIZER;
+ static int efd_used(int fd) { return fd >= 0 && fd < EFD_MAX && g_efd[fd].used && g_efd[fd].host < 0; }   // with g_efd_m held: an event descriptor
+@@ -285,6 +285,16 @@ static int on_host(int fd, int *nb, int *type, int64_t *rcv, int64_t *snd) {   /
+     return h;
+ }
+ // Waits until the host socket has one of events, up to ms (< 0: no bound). 1 ready, 0 timed out, -1 the host is shutting the game down
++// Should this result be traced? Anything but a would-block always, a would-block only the first of a run. Smash's NEX client polls and reads in
++// a tight loop all through a handshake, and tracing every one of those used the whole budget before the match attempt in every log so far
++static int sk_trace_wb(int fd, int wb) {
++    int e = errno, show = 1;
++    pthread_mutex_lock(&g_efd_m);
++    if (sk_used(fd)) { show = !wb || !g_efd[fd].wb; g_efd[fd].wb = wb; }
++    pthread_mutex_unlock(&g_efd_m);
++    errno = e;
++    return show;
++}
+ // A datagram socket's totals, for the line its close logs: what = 0 sent, 1 received, 2 a send that failed
+ static void sk_count(int fd, int what) {
+     pthread_mutex_lock(&g_efd_m);
+@@ -423,7 +433,9 @@ static int on_bind(int fd, const void *a, unsigned n) {
+         pthread_mutex_lock(&g_efd_m);
+         if (sk_used(fd)) g_efd[fd].bport = ntohs(in.sin_port);
+         pthread_mutex_unlock(&g_efd_m);
+-        BTRACE(fd, "socket %d: bind %s -> the parked socket of that port", fd, ip_str(in.sin_addr.s_addr, in.sin_port, d));
++        // Unconditional, like the close totals: the reference client prints "Socket binding to: Udp/59281" and "Reusing the parked udp/59281"
++        // for every one of these, and whether our ports line up with its is the whole NAT-mapping question
++        NXLOG("socket %d: bound to UDP port %u — the parked socket of that port, with the NAT mapping the check observed", fd, ntohs(in.sin_port));
+         return 0;
+     }
+     int r = bind(h, (struct sockaddr *)&in, sizeof in);
+@@ -431,7 +443,8 @@ static int on_bind(int fd, const void *a, unsigned n) {
+         in.sin_addr.s_addr = 0;
+         r = bind(h, (struct sockaddr *)&in, sizeof in);
+     }
+-    BTRACE(fd, "socket %d: bind %s -> %d%s%s", fd, ip_str(in.sin_addr.s_addr, in.sin_port, d), r, r ? ", errno " : "", r ? strerror(errno) : "");
++    if (type == SK_SOCK_DGRAM) NXLOG("socket %d: bound to UDP port %u%s%s", fd, ntohs(in.sin_port), r ? ", failed: " : "", r ? strerror(errno) : "");
++    else BTRACE(fd, "socket %d: bind %s -> %d%s%s", fd, ip_str(in.sin_addr.s_addr, in.sin_port, d), r, r ? ", errno " : "", r ? strerror(errno) : "");
+     if (r) return on_err(errno);
+     pthread_mutex_lock(&g_efd_m);
+     if (sk_used(fd)) g_efd[fd].bport = ntohs(in.sin_port);
+@@ -468,8 +481,9 @@ static long on_recv(int fd, void *b, unsigned long len, int flags, void *a, unsi
+         struct sockaddr_in in; socklen_t il = sizeof in;
+         ssize_t r = recvfrom(h, b, len, flags, a ? (struct sockaddr *)&in : NULL, a ? &il : NULL);
+         if (r >= 0 && type == SK_SOCK_DGRAM) sk_count(fd, 1);
++        int wb = r < 0 && errno == EAGAIN, show = sk_trace_wb(fd, wb);
+         if (r >= 0 && a && type == SK_SOCK_DGRAM) { char d[24]; BTRACE(fd, "socket %d: recvfrom -> %ld from %s", fd, (long)r, ip_str(in.sin_addr.s_addr, in.sin_port, d)); nat_note("reply", b, (long)r, in.sin_addr.s_addr, in.sin_port); }
+-        else BTRACE(fd, "socket %d: recv up to %lu (flags %#x%s) -> %ld%s%s", fd, len, flags, nb ? ", non-blocking" : "", (long)r, r < 0 ? ", errno " : "", r < 0 ? strerror(errno) : "");
++        else if (show) BTRACE(fd, "socket %d: recv up to %lu (flags %#x%s) -> %ld%s%s%s", fd, len, flags, nb ? ", non-blocking" : "", (long)r, r < 0 ? ", errno " : "", r < 0 ? strerror(errno) : "", wb ? " (a run of these is logged once)" : "");
+         if (r >= 0) {
+             if (a && al) { pthread_mutex_lock(&g_efd_m); int br = sk_used(fd) && g_efd[fd].bridge; pthread_mutex_unlock(&g_efd_m);
+                 if (br || il < sizeof in) { memset(&in, 0, sizeof in); in.sin_addr.s_addr = htonl(NX_BRIDGE_IP); in.sin_port = htons(NX_BRIDGE_PORT); }
+@@ -495,8 +509,9 @@ static long on_send(int fd, const void *b, unsigned long len, int flags, const v
+     for (;;) {
+         ssize_t r = to ? sendto(h, b, len, flags, (struct sockaddr *)&in, sizeof in) : send(h, b, len, flags);
+         if (type == SK_SOCK_DGRAM && (r >= 0 || errno != EAGAIN)) { int e = errno; sk_count(fd, r >= 0 ? 0 : 2); errno = e; }
++        int wb = r < 0 && errno == EAGAIN, show = sk_trace_wb(fd, wb);
+         if (to) { char d[24]; BTRACE(fd, "socket %d: sendto %lu -> %ld, %s%s%s", fd, len, (long)r, ip_str(in.sin_addr.s_addr, in.sin_port, d), r < 0 ? ", errno " : "", r < 0 ? strerror(errno) : ""); nat_note("probe", b, (long)len, in.sin_addr.s_addr, in.sin_port); }
+-        else BTRACE(fd, "socket %d: send %lu -> %ld%s%s", fd, len, (long)r, r < 0 ? ", errno " : "", r < 0 ? strerror(errno) : "");
++        else if (show) BTRACE(fd, "socket %d: send %lu -> %ld%s%s%s", fd, len, (long)r, r < 0 ? ", errno " : "", r < 0 ? strerror(errno) : "", wb ? " (a run of these is logged once)" : "");
+         if (r >= 0) return r;
+         if (errno != EAGAIN || nb) return on_err(errno);
+         int w = on_wait(h, POLLOUT, snd > 0 ? snd : -1);
+diff --git a/dm/host/net_nextendo_apple.m b/dm/host/net_nextendo_apple.m
+index ed4904b..39d356e 100644
+--- a/dm/host/net_nextendo_apple.m
++++ b/dm/host/net_nextendo_apple.m
+@@ -61,7 +61,8 @@ static struct {
+     int redirect_port;
+     uint32_t server, nat;          // host order
+     uint16_t server_port;
+-    uint8_t pin[32];
++    uint8_t pin[NX_PINS][32];
++    int npin;
+ } C;
+ static pthread_once_t g_cfg_once = PTHREAD_ONCE_INIT;
+ 
+@@ -71,8 +72,23 @@ static int parse_ip(const char *s, uint32_t *ip) {
+     *ip = ntohl(a.s_addr); return 1;
+ }
+ static int hexval(int c) { return c >= '0' && c <= '9' ? c - '0' : c >= 'a' && c <= 'f' ? c - 'a' + 10 : c >= 'A' && c <= 'F' ? c - 'A' + 10 : -1; }
+-static int parse_pin(const char *s, uint8_t out[32]) {
+-    if (!s || strlen(s) != 64) return 0;
++// DM_NEXTENDO_PIN holds one pin or several, separated by commas: the game server and the other backends the SNI router fronts (the account API
++// is one of them) need not share a key. A pin is 64 hex digits
++static int parse_one_pin(const char *s, uint8_t out[32]);
++static int parse_pins(const char *s) {
++    C.npin = 0;
++    for (const char *p = s; p && *p && C.npin < NX_PINS;) {
++        while (*p == ',' || *p == ' ' || *p == '\t') p++;
++        if (!*p) break;   // a trailing comma or space ends the list rather than failing it
++        size_t n = strcspn(p, ",");
++        while (n && (p[n - 1] == ' ' || p[n - 1] == '\t')) n--;
++        if (n != 64 || !parse_one_pin(p, C.pin[C.npin])) return 0;
++        C.npin++; p += n;
++    }
++    return C.npin > 0;
++}
++static int parse_one_pin(const char *s, uint8_t out[32]) {
++    if (!s) return 0;
+     for (int i = 0; i < 32; i++) {
+         int h = hexval(s[2 * i]), l = hexval(s[2 * i + 1]);
+         if (h < 0 || l < 0) return 0;
+@@ -98,7 +114,7 @@ static void cfg_init(void) {
+     char *colon = strchr(srv, ':');
+     C.server_port = 443;
+     if (colon) { *colon = 0; int p = atoi(colon + 1); if (p > 0 && p < 65536) C.server_port = (uint16_t)p; }
+-    int ok = parse_ip(srv, &C.server) && parse_ip(env("DM_NEXTENDO_NAT", NX_NAT_DEFAULT), &C.nat) && parse_pin(env("DM_NEXTENDO_PIN", NX_PIN_DEFAULT), C.pin);
++    int ok = parse_ip(srv, &C.server) && parse_ip(env("DM_NEXTENDO_NAT", NX_NAT_DEFAULT), &C.nat) && parse_pins(env("DM_NEXTENDO_PIN", NX_PIN_DEFAULT));
+     if (!asked) return;
+     if (!C.game) { LOG("[nextendo] DM_NEXTENDO=1, but this game (%s) is not one the host takes online: it stays offline", id); return; }
+     if (!ok) { LOG("[nextendo] DM_NEXTENDO_SERVER, DM_NEXTENDO_NAT or DM_NEXTENDO_PIN is not valid: offline"); return; }
+@@ -573,7 +589,9 @@ static NSData *spki_der(SecKeyRef key) {   // the key's SubjectPublicKeyInfo, as
+     [out appendBytes:&seq length:1]; len(out, alen + bit.length); [out appendBytes:alg length:alen]; [out appendData:bit];
+     return out;
+ }
+-static int trust_matches_pin(sec_trust_t trust) {
++// 1 when the server's key hashes to one of the configured pins. On a mismatch the hash it does have is logged, so a backend of theirs with a key
++// of its own can be named in DM_NEXTENDO_PIN rather than guessed at (the hash is public: it is in every handshake with that server)
++static int trust_matches_pin(sec_trust_t trust, const char *sni) {
+     SecTrustRef t = sec_trust_copy_ref(trust);
+     if (!t) return 0;
+     int ok = 0;
+@@ -581,7 +599,15 @@ static int trust_matches_pin(sec_trust_t trust) {
+         SecKeyRef k = SecTrustCopyKey(t);
+         NSData *spki = k ? spki_der(k) : nil;
+         if (k) CFRelease(k);
+-        ok = spki && !memcmp(sha256(spki).bytes, C.pin, 32);
++        if (spki) {
++            NSData *h = sha256(spki);
++            for (int i = 0; i < C.npin && !ok; i++) ok = !memcmp(h.bytes, C.pin[i], 32);
++            if (!ok) {
++                char hex[65]; const uint8_t *b = h.bytes;
++                for (int i = 0; i < 32; i++) snprintf(hex + 2 * i, 3, "%02x", b[i]);
++                LOG("[nextendo] the key %s presented is not one of the %d pinned: its SubjectPublicKeyInfo hashes to %s. Add it to DM_NEXTENDO_PIN (commas between pins) to allow it", sni && *sni ? sni : "the server", C.npin, hex);
++            }
++        }
+     }
+     CFRelease(t);
+     return ok;
+@@ -889,8 +915,8 @@ static int bridge_open_(const char *sni, int rewrite_host, uint16_t port) {
+         sec_protocol_options_set_min_tls_protocol_version(so, tls_protocol_version_TLSv12);
+         sec_protocol_options_set_verify_block(so, ^(sec_protocol_metadata_t md, sec_trust_t trust, sec_protocol_verify_complete_t complete) {
+             (void)md;
+-            int ok = trust_matches_pin(trust);
+-            if (!ok) LOG("[nextendo] the game server's key does not match the pin (DM_NEXTENDO_PIN): not connecting");
++            int ok = trust_matches_pin(trust, server_name.UTF8String);
++            if (!ok) LOG("[nextendo] not connecting to %s: its key is not pinned (DM_NEXTENDO_PIN)", server_name.UTF8String);
+             complete(ok);
+         }, b->q);
+     }, ^(nw_protocol_options_t tcp) { nw_tcp_options_set_no_delay(tcp, true); });
+diff --git a/dm/host/net_online.h b/dm/host/net_online.h
+index 2a0f297..a64e8b1 100644
+--- a/dm/host/net_online.h
++++ b/dm/host/net_online.h
+@@ -23,7 +23,9 @@
+ //   DM_NEXTENDO_API             the account API (default https://nextendo.network)
+ //   DM_NEXTENDO_SERVER          the game server, a dotted IPv4 address[:port] (default NX_SERVER_DEFAULT:443)
+ //   DM_NEXTENDO_NAT             the NAT check server, a dotted IPv4 address (default NX_NAT_DEFAULT)
+-//   DM_NEXTENDO_PIN             the game server's public key: SHA-256 of its SubjectPublicKeyInfo, 64 hex digits (default NX_PIN_DEFAULT)
++//   DM_NEXTENDO_PIN             the pinned public keys: SHA-256 of each SubjectPublicKeyInfo, 64 hex digits, commas between several (default NX_PIN_DEFAULT).
++//                               Their router fronts more than the game server, and a backend of theirs may hold a key of its own; a key that is not pinned is
++//                               refused and its hash logged, to be added here
+ //   DM_NEXTENDO_LOG=1           log every socket, name and bridge event, the NEX calls by number and the failures the game records (the PID, tokens and codes are never logged)
+ //   DM_NEXTENDO_SIGNOUT=1       forget the stored account at start (the next online step asks to sign in again)
+ #pragma once
+@@ -38,6 +40,7 @@
+ #define NX_SERVER_DEFAULT "51.178.29.194"
+ #define NX_NAT_DEFAULT "164.132.111.120"
+ #define NX_PIN_DEFAULT "d2e7388e48ee30cfbecfbeb522874f2cc6b85f7aa1105c57669f3c2aa85fb30e"
++#define NX_PINS 8                     // pins DM_NEXTENDO_PIN may hold
+ #define NX_BRIDGE_IP 0x0A0D2501u      // 10.13.37.1, host order: the stand-in address the game's NEX client is given
+ #define NX_BRIDGE_PORT 443
+ 
+diff --git a/docs/env_switches.tsv b/docs/env_switches.tsv
+index 434eb90..8b343d0 100644
+--- a/docs/env_switches.tsv
++++ b/docs/env_switches.tsv
+@@ -129,7 +129,7 @@ DM_NEXTENDO_API	switch	The Nextendo account API (default `https://nextendo.netwo
+ DM_NEXTENDO_CLIENT_ID	switch	The OAuth client ID of your application at nextendo.network/developers; without one the sign-in fails
+ DM_NEXTENDO_LOG	diagnostic	`1` logs every socket, name and bridge event of Nextendo online play, the NEX calls by number and the failures the game records (never the PID, tokens or codes)
+ DM_NEXTENDO_NAT	switch	Nextendo's NAT check server, a dotted IPv4 address
+-DM_NEXTENDO_PIN	switch	The Nextendo game server's public key pin: SHA-256 of its SubjectPublicKeyInfo, 64 hex digits
++DM_NEXTENDO_PIN	switch	The Nextendo servers' public key pins: SHA-256 of each SubjectPublicKeyInfo, 64 hex digits, commas between several
+ DM_NEXTENDO_REDIRECT_PORT	switch	The loopback port of the sign-in redirect your Nextendo application registers, `http://127.0.0.1:<port>/callback` (default `47823`)
+ DM_NEXTENDO_SERVER	switch	Nextendo's game server, a dotted IPv4 address with an optional `:port` (default port 443)
+ DM_NEXTENDO_SIGNOUT	switch	`1` forgets the stored Nextendo account at start; the next online login asks to sign in again
+diff --git a/docs/nextendo.md b/docs/nextendo.md
+index 741b016..aa6b2ef 100644
+--- a/docs/nextendo.md
++++ b/docs/nextendo.md
+@@ -27,7 +27,7 @@ runs offline exactly as before.
+ | nifm | `hle_net.c`, `hle_offline.c` | the network is available; the IP configuration is the host's |
+ | NEX login | `dm/games/01006A800016E000/patches.py`, `hle_net.c` | gate `OBS_NEX_LOGIN` on the login job gives NEX's NgsFacade a direct server address, `10.13.37.1:443`, where NEX speaks its WebSocket without TLS |
+ | nn::ssl | `hle_net.c` | a connection's handshake on a socket connected to the game server swaps the bridge in for that socket, with the host name the game set; Read, Write, Peek and Poll are then the socket's. This is how Mario Kart 8 Deluxe's NEX client logs in, with no patch of the game |
+-| TLS bridge | `net_nextendo_apple.m` | a TCP connection to `10.13.37.1` is a local socket whose other end goes to the game server in TLS (Network.framework), the server's key pinned, the `Host` header rewritten |
++| TLS bridge | `net_nextendo_apple.m` | a TCP connection to `10.13.37.1` is a local socket whose other end goes to the game server in TLS (Network.framework), the server's key checked against the pins of `DM_NEXTENDO_PIN`, the `Host` header rewritten |
+ | Diagnostics | `net_nextendo_apple.m`, `hle_net.c`, `hle_offline.c`, the game's `patches.py` | with `DM_NEXTENDO_LOG=1`: each NEX call that crosses the bridge by protocol and method number, a failed call's result code, what the game reports of its NAT and of each hole punch; every datagram socket's totals at its close and the NAT check's probes and replies; every failure the game records in an `ErrorResultVariant`; and gate `OBS_PIA_FAIL` (Smash 13.0.5) logs each Pia job that fails with its result. No station URL, token, name or player id is read |
+ 
+ ## Mario Kart 8 Deluxe

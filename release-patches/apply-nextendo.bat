@@ -24,6 +24,7 @@ call :one nextendo-ioctl-for-v1.3.0 on_ioctl dm\host\hle_net.c || exit /b 1
 call :one nextendo-nifmtrace-for-v1.3.0 resolver_called dm\host\hle_net.c || exit /b 1
 call :one nextendo-nsd-for-v1.3.0 nsd_resolve_online dm\host\hle_misc.c || exit /b 1
 call :one nextendo-match-for-v1.3.0 sk_opt_host dm\host\hle_net.c || exit /b 1
+call :one nextendo-udplog-for-v1.3.0 sk_trace_wb dm\host\hle_net.c || exit /b 1
 echo.
 echo All Nextendo patches are in. Rebuild the game in the launcher.
 exit /b 0
