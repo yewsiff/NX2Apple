@@ -1,0 +1,106 @@
+diff --git a/dm/host/hle_net.c b/dm/host/hle_net.c
+index ad3c0bc..aea7ec9 100644
+--- a/dm/host/hle_net.c
++++ b/dm/host/hle_net.c
+@@ -467,7 +467,9 @@ static int on_bind(int fd, const void *a, unsigned n) {
+         in.sin_addr.s_addr = 0;
+         r = bind(h, (struct sockaddr *)&in, sizeof in);
+     }
+-    if (type == SK_SOCK_DGRAM) NXLOG("socket %d: bound to UDP port %u%s%s", fd, ntohs(in.sin_port), r ? ", failed: " : "", r ? strerror(errno) : "");
++    // The address as well as the port: a game that knows its own address binds to it, and one that does not binds to 0.0.0.0 — the same address
++    // it would then put in the private half of its station URL, which a server pairing a private candidate with a public one will not accept
++    if (type == SK_SOCK_DGRAM) { char d[24]; NXLOG("socket %d: bound to UDP %s%s%s", fd, ip_str(in.sin_addr.s_addr, in.sin_port, d), r ? ", failed: " : "", r ? strerror(errno) : ""); }
+     else BTRACE(fd, "socket %d: bind %s -> %d%s%s", fd, ip_str(in.sin_addr.s_addr, in.sin_port, d), r, r ? ", errno " : "", r ? strerror(errno) : "");
+     if (r) return on_err(errno);
+     pthread_mutex_lock(&g_efd_m);
+diff --git a/dm/host/hle_offline.c b/dm/host/hle_offline.c
+index 0d89c63..597faf2 100644
+--- a/dm/host/hle_offline.c
++++ b/dm/host/hle_offline.c
+@@ -166,9 +166,14 @@ HLE_FORCE("_ZN2nn4nifm22GetCurrentIpConfigInfoEPNS_6socket6InAddrES3_S3_S3_S3_",
+ // calls whichever its SDK has. Super Smash Bros. Ultimate's is the InAddr one, which went unhooked, so the game ran the SDK's own: that asks the
+ // nifm service over IPC, which is not answered here, and the game went online believing its address to be 0.0.0.0. Its NAT check carried that
+ // address, and Pia, with no address of its own to put in a station URL, gave up before it ever reached the other player
+-HLE_FORCE("_ZN2nn4nifm26GetCurrentPrimaryIpAddressEP7in_addr", "offline: no IP (SDK 10 overload; online: the host's)", Result, h_nifm_GetIp10, uint32_t *a) {
++// This is the overload Super Smash Bros. Ultimate references (DM_IMPORTS=1 shows it bound and the nn::socket::InAddr one unreferenced), and it is
++// the address the game puts in the private half of its station URL. Nextendo's server pairs a private candidate with a public one and refuses to
++// bridge a host that reports no private address at all (natbridge.go selectStations / isPrivateIP, which takes RFC1918 and CGNAT only), so what
++// this returns decides whether a session can be joined. It said nothing until now, which is why no nifm line ever appeared in a log
++HLE_FORCE("_ZN2nn4nifm26GetCurrentPrimaryIpAddressEP7in_addr", "offline: no IP (online: the host's)", Result, h_nifm_GetIp10, uint32_t *a) {
+     uint32_t ip = dm_net_online() ? nx_local_ip() : 0;
+     if (a) *a = htonl(ip);
++    NXLOG("nifm: the game asks for its own address -> %u.%u.%u.%u%s", ip >> 24, ip >> 16 & 255, ip >> 8 & 255, ip & 255, ip ? "" : " (none: reported as a failure)");
+     return ip ? RES_OK : RES_FAIL;
+ }
+ HLE_FORCE("_ZN2nn4nifm18GetCurrentIpConfigEPNS0_10Ipv4ConfigEPiPNS0_10Ipv6ConfigES3_ii", "offline: no IP configuration (SDK 21 overload)", Result, h_nifm_IpCfg21,
+diff --git a/dm/host/net_nextendo_apple.m b/dm/host/net_nextendo_apple.m
+index 39d356e..91fe19d 100644
+--- a/dm/host/net_nextendo_apple.m
++++ b/dm/host/net_nextendo_apple.m
+@@ -13,6 +13,8 @@
+ // reads the "nnex" claim. The RSA key is made once and kept in the Keychain with a random device ID.
+ #include <TargetConditionals.h>
+ #import <Foundation/Foundation.h>
++#include <ifaddrs.h>
++#include <net/if.h>
+ #import <Security/Security.h>
+ #import <Network/Network.h>
+ #import <CommonCrypto/CommonDigest.h>
+@@ -172,16 +174,37 @@ int nx_dest_allowed(uint32_t ip, int udp) {
+     if (udp) return 1;
+     return ip == NX_BRIDGE_IP || ip == C.server || ip == C.nat;
+ }
+-uint32_t nx_local_ip(void) {   // the address the default route would use: connect a UDP socket (no packet is sent) and read its name
++// The device's own address on the network it plays over. The game puts it in the private half of its station URL, and a server that pairs a
++// private candidate with a public one has nothing to bridge without it, so a zero here is a session that cannot be joined
++uint32_t nx_local_ip(void) {
++    // What the default route would use: connect a UDP socket (which sends nothing) and read its name
+     int s = socket(AF_INET, SOCK_DGRAM, 0);
+-    if (s < 0) return 0;
+-    struct sockaddr_in a = {.sin_len = sizeof a, .sin_family = AF_INET, .sin_port = htons(9), .sin_addr.s_addr = htonl(C.server ? C.server : 0x08080808)};
+     uint32_t ip = 0;
+-    if (!connect(s, (struct sockaddr *)&a, sizeof a)) {
+-        struct sockaddr_in me; socklen_t ml = sizeof me;
+-        if (!getsockname(s, (struct sockaddr *)&me, &ml)) ip = ntohl(me.sin_addr.s_addr);
++    if (s >= 0) {
++        struct sockaddr_in a = {.sin_len = sizeof a, .sin_family = AF_INET, .sin_port = htons(9), .sin_addr.s_addr = htonl(C.server ? C.server : 0x08080808)};
++        if (!connect(s, (struct sockaddr *)&a, sizeof a)) {
++            struct sockaddr_in me; socklen_t ml = sizeof me;
++            if (!getsockname(s, (struct sockaddr *)&me, &ml)) ip = ntohl(me.sin_addr.s_addr);
++        }
++        close(s);
++    }
++    if (ip) return ip;
++    // No route yet (the interface still coming up, or the address asked for before the network is ready): the first address of an interface that
++    // is up and is not the loopback, Wi-Fi (en*) ahead of the rest
++    struct ifaddrs *list = NULL;
++    if (getifaddrs(&list)) return 0;
++    uint32_t best = 0, any = 0;
++    for (struct ifaddrs *f = list; f; f = f->ifa_next) {
++        if (!f->ifa_addr || f->ifa_addr->sa_family != AF_INET) continue;
++        if (!(f->ifa_flags & IFF_UP) || (f->ifa_flags & IFF_LOOPBACK)) continue;
++        uint32_t v = ntohl(((struct sockaddr_in *)f->ifa_addr)->sin_addr.s_addr);
++        if (!v || (v >> 24) == 127) continue;
++        if (!any) any = v;
++        if (!best && f->ifa_name && f->ifa_name[0] == 'e' && f->ifa_name[1] == 'n') best = v;
+     }
+-    close(s);
++    freeifaddrs(list);
++    ip = best ? best : any;
++    if (ip) NXLOG("the default route gave no address of ours; an interface that is up has %u.%u.%u.%u", ip >> 24, ip >> 16 & 255, ip >> 8 & 255, ip & 255);
+     return ip;
+ }
+ 
+diff --git a/docs/nextendo.md b/docs/nextendo.md
+index 3527f65..ad7c342 100644
+--- a/docs/nextendo.md
++++ b/docs/nextendo.md
+@@ -24,7 +24,7 @@ runs offline exactly as before.
+ | Account | `net_nextendo_apple.m` | OAuth 2.0 authorization code + PKCE in an in-app sheet (iPhone) or the browser (Mac), redirect caught on `127.0.0.1`; refresh token in the Keychain; `GET /api/nex-token` gives the NEX login token and the PID |
+ | ID token | `net_nextendo_apple.m`, `hle_account.c` | the network service account's ID token: a JWT shaped like Nintendo BaaS's with the PID as `sub` and the NEX token as `nnex` |
+ | Sockets | `dm/host/hle_net.c`, `hle_offline.c` | `nn::socket` on the host's BSD sockets (non-blocking at the host; the game's blocking calls wait in slices). TCP reaches Nextendo only, UDP any address (Pia's peers). Errnos and `O_NONBLOCK` (0x800) are Linux's, as the console's library has them; only the socket options whose number means the same on Horizon and on Apple's kernel reach the host socket, the others are kept and read back as set |
+-| nifm | `hle_net.c`, `hle_offline.c` | the network is available; the IP configuration is the host's. A game calls whichever overload its SDK has, so both are hooked for `GetCurrentPrimaryIpAddress` (`nn::socket::InAddr` in `hle_net.c`, `in_addr` in `hle_offline.c`) and for `GetCurrentIpConfigInfo` — each exactly once, since the loader stops a game whose forced-takeover list holds a name twice |
++| nifm | `hle_net.c`, `hle_offline.c` | the network is available; the IP configuration is the host's, logged when online because the game puts that address in the private half of its station URL and a server pairing a private candidate with a public one has nothing to bridge without it. A game calls whichever overload its SDK has, so both are hooked for `GetCurrentPrimaryIpAddress` (`nn::socket::InAddr` in `hle_net.c`, `in_addr` in `hle_offline.c`) and for `GetCurrentIpConfigInfo` — each exactly once, since the loader stops a game whose forced-takeover list holds a name twice |
+ | NEX login | `dm/games/01006A800016E000/patches.py`, `hle_net.c` | gate `OBS_NEX_LOGIN` on the login job gives NEX's NgsFacade a direct server address, `10.13.37.1:443`, where NEX speaks its WebSocket without TLS |
+ | nn::ssl | `hle_net.c` | a connection's handshake on a socket connected to the game server swaps the bridge in for that socket, with the host name the game set; Read, Write, Peek and Poll are then the socket's. This is how Mario Kart 8 Deluxe's NEX client logs in, with no patch of the game |
+ | TLS bridge | `net_nextendo_apple.m`, `hle_net.c` | a TCP connection to `10.13.37.1`, or to the game server on the port its station URL names, is a local socket whose other end goes to the server in TLS (Network.framework), the server's key checked against the pins of `DM_NEXTENDO_PIN`, the `Host` header rewritten. Port 443 on the server is the game's own HTTPS and is left plain: `nn::ssl`'s handshake puts the bridge in its place with the name the game set, and if the game writes in clear there instead, its first bytes bring the bridge in |
