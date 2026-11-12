@@ -1,0 +1,122 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: yewsifofficial <yewsifofficial@gmail.com>
+Date: Wed, 11 Nov 2026 23:33:34 -0500
+Subject: [PATCH] nifm: the overload this game calls, so it knows its own
+ address
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+With the account API restored and the socket numbers right, the NAT check
+now runs and succeeds: 20 probes out and 10 answers back on each of its two
+sockets, both servers reporting the same external port (mapping 1, the best
+case), and the play socket adopting the parked port exactly as the working
+client's does. Pia still gave up before reaching the other player, and the
+probes said why:
+
+  NAT check: probe 101 to 51.178.29.194:10025 (our address in it 0.0.0.0)
+
+The game does not know its own address. nn::nifm::GetCurrentPrimaryIpAddress
+has two overloads, one taking in_addr and one taking nn::socket::InAddr, and
+a game calls whichever its SDK has. Only the in_addr one was hooked. This
+SDK defines the InAddr one, so the hook never bound, the game ran the SDK's
+own, that asked the nifm service over IPC, which is not answered here, and
+the game went online with 0.0.0.0. Pia had no address to put in a station
+URL, so after its three packets to the session server it had nothing to
+offer a peer and failed — error 2618-0578, with the game leaving the session
+immediately afterwards (EndParticipation).
+
+Both overloads are hooked now, as GetCurrentIpConfigInfo already was, and
+the address is logged when online.
+
+Two diagnostics, so the next log stays readable. The Pia gate's first output
+had neither a Pia-looking result nor a caller inside any module, so the
+registers are not what its reading assumed: it now prints what they hold and
+claims nothing about them, keeping only the moment it fires, which is worth
+having since nothing else marks a Pia failure. And a run of the same
+ErrorResultVariant code is logged once: 2162-0001 appeared fifteen times
+while everything was working.
+
+Upstream-Status: fork-only (online play is out of nxnative's scope)
+Reason: Nextendo online play for Super Smash Bros. Ultimate
+Issue: yewsiff/NX2Apple (no tracker: issues are disabled on this fork)
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_017xdHQoEipBX2wTqN8BNnMv
+---
+ dm/host/hle_net.c     | 10 ++++++++--
+ dm/host/hle_offline.c | 13 +++++++++++--
+ docs/nextendo.md      |  2 +-
+ 3 files changed, 20 insertions(+), 5 deletions(-)
+
+diff --git a/dm/host/hle_net.c b/dm/host/hle_net.c
+index f989198..ad3c0bc 100644
+--- a/dm/host/hle_net.c
++++ b/dm/host/hle_net.c
+@@ -844,10 +844,16 @@ static void obs_pia_fail(uint64_t *regs, int param) {
+     if (!dm_net_online()) return;
+     static _Atomic int n;
+     if (atomic_fetch_add(&n, 1) >= 64) return;
+-    uint32_t r = regs[1] > 0x10000 && !(regs[1] & 3) ? *(const uint32_t *)regs[1] : 0;   // (a reference: the function's first act is to copy what it points at)
++    // The function was found for 13.0.5 by its first instruction, and the result is meant to be the word x1 points at. The first log it produced
++    // had neither a Pia-looking result nor a caller inside any module, so the registers here are not what that reading assumed: until the
++    // function is disassembled on this build, the line says what the registers hold and claims nothing about them. The moment it fires is still
++    // worth having, since Pia keeps its results to itself and nothing else marks the failure
++    uint32_t r = regs[1] > 0x10000 && !(regs[1] & 3) ? *(const uint32_t *)regs[1] : 0;
+     const void *lr = (const void *)regs[30];
+     module_t *m = module_of(lr);
+-    LOG("[nextendo] a Pia job failed: result %u (%#x), reported from %s+%#llx", r, r, m ? m->name : "?", m ? (unsigned long long)((const uint8_t *)lr - m->base) : (unsigned long long)regs[30]);
++    if (m) LOG("[nextendo] a Pia job failed: result %u (%#x), from %s+%#llx", r, r, m->name, (unsigned long long)((const uint8_t *)lr - m->base));
++    else LOG("[nextendo] a Pia job gate fired (x0 %#llx, x1 %#llx, x30 %#llx: no caller inside a module, so these are not the job and its result — the gate's address wants checking on this build)",
++             (unsigned long long)regs[0], (unsigned long long)regs[1], (unsigned long long)regs[30]);
+ }
+ __attribute__((constructor)) static void net_obs_init(void) { gate_obs_set(OBS_NEX_LOGIN, obs_nex_login); gate_obs_set(OBS_PIA_FAIL, obs_pia_fail); }
+ 
+diff --git a/dm/host/hle_offline.c b/dm/host/hle_offline.c
+index e642fd5..c5e34ee 100644
+--- a/dm/host/hle_offline.c
++++ b/dm/host/hle_offline.c
+@@ -162,11 +162,18 @@ HLE_FORCE("_ZN2nn4nifm22GetCurrentIpConfigInfoEPNS_6socket6InAddrES3_S3_S3_S3_",
+     if (dm_net_online() && net_ip_config(a, b, c, d, e)) return RES_OK;
+     uint32_t *p[5] = {a, b, c, d, e}; for (int i = 0; i < 5; i++) if (p[i]) *p[i] = 0; return RES_FAIL;
+ }
+-HLE_FORCE("_ZN2nn4nifm26GetCurrentPrimaryIpAddressEP7in_addr", "offline: no IP (SDK 10 overload; online: the host's)", Result, h_nifm_GetIp10, uint32_t *a) {
++// The device's own address. Both overloads: the SDK defines this one with nn::socket::InAddr and the generation above with in_addr, and a game
++// calls whichever its SDK has. Super Smash Bros. Ultimate's is the InAddr one, which went unhooked, so the game ran the SDK's own: that asks the
++// nifm service over IPC, which is not answered here, and the game went online believing its address to be 0.0.0.0. Its NAT check carried that
++// address, and Pia, with no address of its own to put in a station URL, gave up before it ever reached the other player
++static Result nifm_primary_ip(uint32_t *a) {
+     uint32_t ip = dm_net_online() ? nx_local_ip() : 0;
+     if (a) *a = htonl(ip);
++    if (dm_net_online()) NXLOG("nifm: the game asks for its own address -> %u.%u.%u.%u%s", ip >> 24, ip >> 16 & 255, ip >> 8 & 255, ip & 255, ip ? "" : " (none: reported as a failure)");
+     return ip ? RES_OK : RES_FAIL;
+ }
++HLE_FORCE("_ZN2nn4nifm26GetCurrentPrimaryIpAddressEP7in_addr", "offline: no IP (online: the host's)", Result, h_nifm_GetIp10, uint32_t *a) { return nifm_primary_ip(a); }
++HLE_FORCE("_ZN2nn4nifm26GetCurrentPrimaryIpAddressEPNS_6socket6InAddrE", "offline: no IP (socket::InAddr overload; online: the host's)", Result, h_nifm_GetIpSk, uint32_t *a) { return nifm_primary_ip(a); }
+ // SDK 21 (Star Fox): the IPv4 and IPv6 configurations at once, with their counts
+ HLE_FORCE("_ZN2nn4nifm18GetCurrentIpConfigEPNS0_10Ipv4ConfigEPiPNS0_10Ipv6ConfigES3_ii", "offline: no IP configuration (SDK 21 overload)", Result, h_nifm_IpCfg21,
+           void *v4, int *n4, void *v6, int *n6, int c4, int c6) { (void)v4; (void)v6; (void)c4; (void)c6; if (n4) *n4 = 0; if (n6) *n6 = 0; return RES_FAIL; }
+@@ -210,7 +217,9 @@ static void *err_variant_pass(void *v, const uint32_t *a, const char *sym, void
+     if (!*looked) { *orig = (void *(*)(void *, const uint32_t *))guest_sym(sym); *looked = 1; }
+     uint32_t w0 = a ? a[0] : 0, w1 = a && code ? a[1] : 0;
+     static _Atomic int n;
+-    if ((w0 || w1) && dm_net_online() && atomic_fetch_add(&n, 1) < 200) {
++    static _Atomic uint64_t last;   // the game records the same ordinary result over and over while all is well; a run of one code is logged once
++    uint64_t this = (uint64_t)code << 62 | (uint64_t)w1 << 32 | w0;
++    if ((w0 || w1) && dm_net_online() && atomic_exchange(&last, this) != this && atomic_fetch_add(&n, 1) < 200) {
+         if (code) LOG("[nextendo] the game records a failure: error code %04u-%04u", w0, w1);
+         else LOG("[nextendo] the game records a failure: result %#x = %04u-%04u", w0, 2000 + (w0 & 0x1ff), (w0 >> 9) & 0x1fff);
+     }
+diff --git a/docs/nextendo.md b/docs/nextendo.md
+index 6637555..48a53db 100644
+--- a/docs/nextendo.md
++++ b/docs/nextendo.md
+@@ -24,7 +24,7 @@ runs offline exactly as before.
+ | Account | `net_nextendo_apple.m` | OAuth 2.0 authorization code + PKCE in an in-app sheet (iPhone) or the browser (Mac), redirect caught on `127.0.0.1`; refresh token in the Keychain; `GET /api/nex-token` gives the NEX login token and the PID |
+ | ID token | `net_nextendo_apple.m`, `hle_account.c` | the network service account's ID token: a JWT shaped like Nintendo BaaS's with the PID as `sub` and the NEX token as `nnex` |
+ | Sockets | `dm/host/hle_net.c`, `hle_offline.c` | `nn::socket` on the host's BSD sockets (non-blocking at the host; the game's blocking calls wait in slices). TCP reaches Nextendo only, UDP any address (Pia's peers). Errnos and `O_NONBLOCK` (0x800) are Linux's, as the console's library has them; only the socket options whose number means the same on Horizon and on Apple's kernel reach the host socket, the others are kept and read back as set |
+-| nifm | `hle_net.c`, `hle_offline.c` | the network is available; the IP configuration is the host's |
++| nifm | `hle_net.c`, `hle_offline.c` | the network is available; the IP configuration is the host's, through both overloads of `GetCurrentPrimaryIpAddress` and of `GetCurrentIpConfigInfo` (`in_addr` and `nn::socket::InAddr`: a game calls whichever its SDK has, and one left unhooked sends it online believing its address to be 0.0.0.0, with no address to put in a station URL) |
+ | NEX login | `dm/games/01006A800016E000/patches.py`, `hle_net.c` | gate `OBS_NEX_LOGIN` on the login job gives NEX's NgsFacade a direct server address, `10.13.37.1:443`, where NEX speaks its WebSocket without TLS |
+ | nn::ssl | `hle_net.c` | a connection's handshake on a socket connected to the game server swaps the bridge in for that socket, with the host name the game set; Read, Write, Peek and Poll are then the socket's. This is how Mario Kart 8 Deluxe's NEX client logs in, with no patch of the game |
+ | TLS bridge | `net_nextendo_apple.m`, `hle_net.c` | a TCP connection to `10.13.37.1`, or to the game server on the port its station URL names, is a local socket whose other end goes to the server in TLS (Network.framework), the server's key checked against the pins of `DM_NEXTENDO_PIN`, the `Host` header rewritten. Port 443 on the server is the game's own HTTPS and is left plain: `nn::ssl`'s handshake puts the bridge in its place with the name the game set, and if the game writes in clear there instead, its first bytes bring the bridge in |

@@ -102,3 +102,4 @@
 0137-nextendo-socket-numbers-and-match-trace.patch
 0138-nextendo-udp-log-and-pins.patch
 0139-nextendo-ssl-443-passthrough.patch
+0140-nextendo-nifm-own-address.patch
