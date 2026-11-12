@@ -1,0 +1,34 @@
+diff --git a/dm/host/net_nextendo_apple.m b/dm/host/net_nextendo_apple.m
+index 4bc5851..b9c2c3d 100644
+--- a/dm/host/net_nextendo_apple.m
++++ b/dm/host/net_nextendo_apple.m
+@@ -723,7 +723,8 @@ static uint32_t le32(const uint8_t *b) { return (uint32_t)b[0] | (uint32_t)b[1]
+ // The station URLs in a message, logged as they stand. They are plain strings in the payload ("address=...;port=...;type=...;Pa=..."), and they
+ // are the whole of what a server has to work with when it pairs a private candidate with a public one for a hole punch: which addresses and
+ // ports the game registers for itself, and which ones it is given for the other player. Nothing else in these messages is read
+-static void nex_stations(const uint8_t *b, unsigned n, const char *what) {
++static int nex_stations(const uint8_t *b, unsigned n, const char *what) {
++    int found = 0;
+     for (unsigned i = 0; i + 8 < n; i++) {
+         if (memcmp(b + i, "address=", 8)) continue;
+         unsigned s0 = i;
+@@ -733,8 +734,19 @@ static void nex_stations(const uint8_t *b, unsigned n, const char *what) {
+         char t[256]; unsigned len = e - s0 < sizeof t - 1 ? e - s0 : (unsigned)sizeof t - 1;
+         memcpy(t, b + s0, len); t[len] = 0;
+         LOG("[nextendo] station URL (%s): %s", what, t);
++        found++;
+         i = e;
+     }
++    // Nothing that looks like one. Either these messages do not carry them in the clear, or they are laid out differently from the assumption
++    // here, and the only way to tell is to see the bytes: the head of the message, printable characters as themselves and the rest as dots
++    if (!found) {
++        char hex[3 * 48 + 1], asc[49];
++        unsigned k = n < 48 ? n : 48;
++        for (unsigned i = 0; i < k; i++) { snprintf(hex + 3 * i, 4, "%02x ", b[i]); asc[i] = b[i] >= 0x20 && b[i] < 0x7f ? (char)b[i] : '.'; }
++        hex[3 * k] = 0; asc[k] = 0;
++        LOG("[nextendo] no station URL in the %s message (%u bytes); its first %u: %s|%s", what, n, k, hex, asc);
++    }
++    return found;
+ }
+ // 1 when a line was written. b: the first n bytes of the frame's payload (unmasked), total: the payload's whole length. *split: a split message is passing
+ static int nex_note(const uint8_t *b, unsigned n, uint64_t total, int dir, int *split, int quiet) {
