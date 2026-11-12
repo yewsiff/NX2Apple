@@ -1,0 +1,77 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: yewsifofficial <yewsifofficial@gmail.com>
+Date: Thu, 12 Nov 2026 18:48:32 -0500
+Subject: [PATCH] nextendo: say where the game gives up, and stop the capture
+ cutting the login short
+
+Measured against the working emulator's trace of the same minute, with both
+logs now stamped. Everything that can be counted agrees: the same twenty
+probes and ten replies on the same two responders, the same park and adopt,
+the same peer handed over, and neither client receives a single datagram on
+the play socket between adopting it and deciding what to do. The emulator
+then polls that empty socket for 962 ms and reaches the peer. This engine
+abandons the session 467 microseconds after the third probe, having made no
+socket call in between. Nothing it was given differs, so Pia is reading
+state of its own and taking another branch.
+
+The gate placed by offset cannot say where: its own line admits the caller
+it reports lies outside every module, so its address is wrong for this
+build. nn::err::ErrorResultVariant is called by the game itself with a real
+return address, and it is already where 2618-0578 is read. So the first few
+Pia failures recorded there now carry a backtrace, which names the module
+and offset the session was abandoned at. Only Pia's own module and only four
+of them: the game records ordinary results here constantly while all is
+well.
+
+The frame capture was also cutting the one message that matters in half. The
+login frame is about 1,250 bytes and the capture held 640, so the 1,145-byte
+ID token inside it lay outside what the decoder could see and was reported
+missing -- a fault in this engine's logging, not in the login. The capture
+is now 2,048 bytes.
+
+Upstream-Status: fork-only (online play is out of nxnative's scope)
+Reason: Nextendo online play for Super Smash Bros. Ultimate
+Issue: yewsiff/NX2Apple (no tracker: issues are disabled on this fork)
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_017xdHQoEipBX2wTqN8BNnMv
+---
+ dm/host/hle_offline.c        | 11 ++++++++++-
+ dm/host/net_nextendo_apple.m |  2 +-
+ 2 files changed, 11 insertions(+), 2 deletions(-)
+
+diff --git a/dm/host/hle_offline.c b/dm/host/hle_offline.c
+index df41eff..eca9f33 100644
+--- a/dm/host/hle_offline.c
++++ b/dm/host/hle_offline.c
+@@ -221,8 +221,17 @@ static void *err_variant_pass(void *v, const uint32_t *a, const char *sym, void
+     static _Atomic uint64_t last;   // the game records the same ordinary result over and over while all is well; a run of one code is logged once
+     uint64_t this = (uint64_t)code << 62 | (uint64_t)w1 << 32 | w0;
+     if ((w0 || w1) && dm_net_online() && atomic_exchange(&last, this) != this && atomic_fetch_add(&n, 1) < 200) {
++        unsigned mod = code ? w0 : 2000 + (w0 & 0x1ff), desc = code ? w1 : (w0 >> 9) & 0x1fff;
+         if (code) NXLOGA("the game records a failure: error code %04u-%04u", w0, w1);
+-        else NXLOGA("the game records a failure: result %#x = %04u-%04u", w0, 2000 + (w0 & 0x1ff), (w0 >> 9) & 0x1fff);
++        else NXLOGA("the game records a failure: result %#x = %04u-%04u", w0, mod, desc);
++        // Pia keeps its own results to itself and gives up without a word, so where it gave up is the one thing left to learn. This call has a
++        // real return address, unlike the gate placed by offset, so the frames above it name the module and offset Pia abandoned the session at.
++        // Only the first few, and only for Pia's own module (2618): the game records ordinary results here constantly while all is well
++        static _Atomic int bt;
++        if (mod == 2618 && atomic_fetch_add(&bt, 1) < 4) {
++            NXLOGA("where the game gave up on %04u-%04u (innermost first):", mod, desc);
++            dm_backtrace((uint64_t)__builtin_frame_address(0));
++        }
+     }
+     if (*orig) return (*orig)(v, a);
+     if (v) { uint32_t *o = v; o[0] = code ? 2 : 1; o[1] = w0; if (code) o[2] = w1; }   // (no definition to call: the Result form as above, the ErrorCode form by the next state)
+diff --git a/dm/host/net_nextendo_apple.m b/dm/host/net_nextendo_apple.m
+index 254f42c..4f953e8 100644
+--- a/dm/host/net_nextendo_apple.m
++++ b/dm/host/net_nextendo_apple.m
+@@ -652,7 +652,7 @@ static int trust_matches_pin(sec_trust_t trust, const char *sni) {
+     uint64_t sent, got;
+     NSMutableData *rhead;     // the server's HTTP head until its blank line
+     int rhead_done, nframes[2];
+-    struct { int have; uint8_t h[14]; uint64_t skip, len; int op, masked; uint8_t mask[4]; unsigned pos, capn; uint8_t cap[640]; } ws[2];   // 0: game → server, 1: server → game
++    struct { int have; uint8_t h[14]; uint64_t skip, len; int op, masked; uint8_t mask[4]; unsigned pos, capn; uint8_t cap[2048]; } ws[2];   // 2048: the login frame is about 1,250 bytes, and at 640 the ID token inside it fell outside the capture and was reported missing   // 0: game → server, 1: server → game
+     int nnex, split[2];       // NEX calls logged so far; a split NEX message is passing in this direction
+     NSMutableData *cbody[2];  // a close frame's body while it passes
+     NSString *wsproto;        // the WebSocket subprotocol the game's request asks for ("NEX"); the server's answer must name it

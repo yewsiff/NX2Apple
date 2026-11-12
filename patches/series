@@ -109,3 +109,4 @@
 0144-nextendo-udp-icmp.patch
 0145-nextendo-login-identity.patch
 0146-nextendo-log-time-and-login.patch
+0147-nextendo-giveup-backtrace.patch

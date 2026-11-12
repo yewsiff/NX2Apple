@@ -1278,7 +1278,7 @@ index aa82a2a..cbbe9b9 100644
  #define SSC(m, cname) HLE_FORCE(m, "ssl service (cut): fails", Result, cname, void) { return RES_FAIL; }
  SSC("nnsslConnectionCreate", h_nssl_Create) SSC("nnsslConnectionDestroy", h_nssl_Destroy)
 diff --git a/dm/host/hle_offline.c b/dm/host/hle_offline.c
-index 9aaedd5..df41eff 100644
+index 9aaedd5..eca9f33 100644
 --- a/dm/host/hle_offline.c
 +++ b/dm/host/hle_offline.c
 @@ -2,6 +2,16 @@
@@ -1398,7 +1398,7 @@ index 9aaedd5..df41eff 100644
  HLE_FORCE("_ZN2nn4nifm18GetCurrentIpConfigEPNS0_10Ipv4ConfigEPiPNS0_10Ipv6ConfigES3_ii", "offline: no IP configuration (SDK 21 overload)", Result, h_nifm_IpCfg21,
            void *v4, int *n4, void *v6, int *n6, int c4, int c6) { (void)v4; (void)v6; (void)c4; (void)c6; if (n4) *n4 = 0; if (n6) *n6 = 0; return RES_FAIL; }
  // EnvironmentIdentifier = char[8]: retail environment "lp1"
-@@ -165,7 +202,41 @@ HLE_FORCE("_ZN2nn3ngc46MaskProfanityWordsInTextForPlatformRegionChinaEPc", "Chin
+@@ -165,7 +202,50 @@ HLE_FORCE("_ZN2nn3ngc46MaskProfanityWordsInTextForPlatformRegionChinaEPc", "Chin
  
  // ---------- err: error display applet. Only logged, no UI is shown ----------
  HLE_FORCE("_ZN2nn3err9ShowErrorENS0_9ErrorCodeE", "error display applet; the host only logs it", void, h_err_ShowCode, uint64_t code) { DM_APPLET("error"); LOG("game asks to show an error: %04u-%04u", (unsigned)(code & 0xffffffff), (unsigned)(code >> 32)); }
@@ -1422,8 +1422,17 @@ index 9aaedd5..df41eff 100644
 +    static _Atomic uint64_t last;   // the game records the same ordinary result over and over while all is well; a run of one code is logged once
 +    uint64_t this = (uint64_t)code << 62 | (uint64_t)w1 << 32 | w0;
 +    if ((w0 || w1) && dm_net_online() && atomic_exchange(&last, this) != this && atomic_fetch_add(&n, 1) < 200) {
++        unsigned mod = code ? w0 : 2000 + (w0 & 0x1ff), desc = code ? w1 : (w0 >> 9) & 0x1fff;
 +        if (code) NXLOGA("the game records a failure: error code %04u-%04u", w0, w1);
-+        else NXLOGA("the game records a failure: result %#x = %04u-%04u", w0, 2000 + (w0 & 0x1ff), (w0 >> 9) & 0x1fff);
++        else NXLOGA("the game records a failure: result %#x = %04u-%04u", w0, mod, desc);
++        // Pia keeps its own results to itself and gives up without a word, so where it gave up is the one thing left to learn. This call has a
++        // real return address, unlike the gate placed by offset, so the frames above it name the module and offset Pia abandoned the session at.
++        // Only the first few, and only for Pia's own module (2618): the game records ordinary results here constantly while all is well
++        static _Atomic int bt;
++        if (mod == 2618 && atomic_fetch_add(&bt, 1) < 4) {
++            NXLOGA("where the game gave up on %04u-%04u (innermost first):", mod, desc);
++            dm_backtrace((uint64_t)__builtin_frame_address(0));
++        }
 +    }
 +    if (*orig) return (*orig)(v, a);
 +    if (v) { uint32_t *o = v; o[0] = code ? 2 : 1; o[1] = w0; if (code) o[2] = w1; }   // (no definition to call: the Result form as above, the ErrorCode form by the next state)
@@ -1441,7 +1450,7 @@ index 9aaedd5..df41eff 100644
  HLE_FORCE("_ZN2nn3err40ShowUnacceptableAddOnContentVersionErrorEv", "add-on content version mismatch error applet; the host only logs it", void, h_err_AocVer, void) { DM_APPLET("error"); LOG("game asks to show an error: add-on content version mismatch"); }
  HLE_FORCE("_ZN2nn3err39ShowUnacceptableApplicationVersionErrorEv", "game version mismatch error applet; the host only logs it", void, h_err_AppVer, void) { DM_APPLET("error"); LOG("game asks to show an error: game version mismatch"); }
  // Pokémon Legends: Z-A (SDK 19): the application's own error screen (an error code number and two messages in the argument) goes through the error applet as well
-@@ -189,14 +260,14 @@ HLE_FORCE("_ZN2nn3web11ShowWebPageEPNS0_18WebPageReturnValueERKNS0_14ShowWebPage
+@@ -189,14 +269,14 @@ HLE_FORCE("_ZN2nn3web11ShowWebPageEPNS0_18WebPageReturnValueERKNS0_14ShowWebPage
  // Octopath Traveler 0 imports the offline HTML page applet too (pages shipped in the game's HTML document NCA, which the host does not extract)
  
  // ---------- C interface (nnsocket* / nnssl*): offline as well. The arguments are all in registers and the host does not look at them ----------
@@ -1464,7 +1473,7 @@ index 9aaedd5..df41eff 100644
  // ---------- bcat: news / data delivered from the server (Super Mario Odyssey). Initialize talks to the bcat service (an SDK abort without it); mounting the delivery cache fails,
 diff --git a/dm/host/net_nextendo_apple.m b/dm/host/net_nextendo_apple.m
 new file mode 100644
-index 0000000..254f42c
+index 0000000..4f953e8
 --- /dev/null
 +++ b/dm/host/net_nextendo_apple.m
 @@ -0,0 +1,1088 @@
@@ -2122,7 +2131,7 @@ index 0000000..254f42c
 +    uint64_t sent, got;
 +    NSMutableData *rhead;     // the server's HTTP head until its blank line
 +    int rhead_done, nframes[2];
-+    struct { int have; uint8_t h[14]; uint64_t skip, len; int op, masked; uint8_t mask[4]; unsigned pos, capn; uint8_t cap[640]; } ws[2];   // 0: game → server, 1: server → game
++    struct { int have; uint8_t h[14]; uint64_t skip, len; int op, masked; uint8_t mask[4]; unsigned pos, capn; uint8_t cap[2048]; } ws[2];   // 2048: the login frame is about 1,250 bytes, and at 640 the ID token inside it fell outside the capture and was reported missing   // 0: game → server, 1: server → game
 +    int nnex, split[2];       // NEX calls logged so far; a split NEX message is passing in this direction
 +    NSMutableData *cbody[2];  // a close frame's body while it passes
 +    NSString *wsproto;        // the WebSocket subprotocol the game's request asks for ("NEX"); the server's answer must name it
