@@ -1,0 +1,48 @@
+diff --git a/dm/host/hle_net.c b/dm/host/hle_net.c
+index aea7ec9..c8bc563 100644
+--- a/dm/host/hle_net.c
++++ b/dm/host/hle_net.c
+@@ -287,6 +287,15 @@ static int on_host(int fd, int *nb, int *type, int64_t *rcv, int64_t *snd) {   /
+ // Waits until the host socket has one of events, up to ms (< 0: no bound). 1 ready, 0 timed out, -1 the host is shutting the game down
+ // Should this result be traced? Anything but a would-block always, a would-block only the first of a run. Smash's NEX client polls and reads in
+ // a tight loop all through a handshake, and tracing every one of those used the whole budget before the match attempt in every log so far
++// The errors a datagram socket on this kernel reports because an earlier send drew back an ICMP message, most often "port unreachable". Horizon's
++// own socket layer never shows these to the game: Pia aims a part of its NAT-check burst at ports that are meant to go unanswered (33334, and the
++// 76-byte datagrams to 33335), so every one of them can leave an error waiting on a socket the game then reads for a real reply. The emulator that
++// does play this game online turns the same reporting off at the socket (ryujinx-nextendo, DefaultSocket::DisableUdpConnReset), having measured
++// where it leads: "S2/MK8 read as the network dropping -> it closed the online session -> 'A communication error has occurred'". ENETDOWN is not in
++// the list: the interface really going away is a thing the game should be told about
++static int sk_udp_icmp(int e) {
++    return e == ECONNRESET || e == ECONNREFUSED || e == EHOSTUNREACH || e == ENETUNREACH || e == EHOSTDOWN || e == ENETRESET;
++}
+ static int sk_trace_wb(int fd, int wb) {
+     int e = errno, show = 1;
+     pthread_mutex_lock(&g_efd_m);
+@@ -333,7 +342,13 @@ static int on_wait(int h, short events, int64_t ms) {
+ }
+ static int on_socket(int family, int type, int proto) {
+     int nb = (type & (SK_NONBLOCK_TYPE | SK_O_NONBLOCK_ALT)) != 0; type &= 0xff;   // the flag in the type: FreeBSD's bit, or O_NONBLOCK's own value (WindowSmash takes both for this game)
+-    if (family != SK_AF_INET || (type != SK_SOCK_STREAM && type != SK_SOCK_DGRAM)) return on_err(EAFNOSUPPORT);
++    // Only IPv4 is made here. An AF_INET6 socket would need a dual-stack one of the host's, as the emulator gives it (ryujinx-nextendo,
++    // DefaultSocket::EnableDualStack, for games whose client connects to an IPv4 address mapped into v6), and every address this file
++    // passes is an IPv4 sockaddr; no game taken online here has asked yet, and this line is how the next log would say that one has
++    if (family != SK_AF_INET || (type != SK_SOCK_STREAM && type != SK_SOCK_DGRAM)) {
++        NXLOG("socket: family %d type %d is not one made here (only IPv4 stream and datagram): refused", family, type);
++        return on_err(EAFNOSUPPORT);
++    }
+     int h = socket(AF_INET, type, proto);
+     if (h < 0) return on_err(errno);
+     fcntl(h, F_SETFL, fcntl(h, F_GETFL) | O_NONBLOCK);
+@@ -506,6 +521,12 @@ static long on_recv(int fd, void *b, unsigned long len, int flags, void *a, unsi
+     for (;;) {
+         struct sockaddr_in in; socklen_t il = sizeof in;
+         ssize_t r = recvfrom(h, b, len, flags, a ? (struct sockaddr *)&in : NULL, a ? &il : NULL);
++        if (r < 0 && type == SK_SOCK_DGRAM && sk_udp_icmp(errno)) {   // sk_udp_icmp: an unanswered probe's ICMP, which the console's socket layer swallows
++            int e = errno;
++            NXLOG("socket %d: a UDP read came back %s, which an unanswered probe leaves behind and Horizon never shows: reported as nothing to read", fd, strerror(e));
++            sk_trace_wb(fd, 0);
++            return on_err(EAGAIN);   // not EAGAIN on through the wait below: the error has already been taken off the socket, so there is nothing to wait for
++        }
+         if (r >= 0 && type == SK_SOCK_DGRAM) sk_count(fd, 1);
+         int wb = r < 0 && errno == EAGAIN, show = sk_trace_wb(fd, wb);
+         if (r >= 0 && a && type == SK_SOCK_DGRAM) { char d[24]; BTRACE(fd, "socket %d: recvfrom -> %ld from %s", fd, (long)r, ip_str(in.sin_addr.s_addr, in.sin_port, d)); nat_note("reply", b, (long)r, in.sin_addr.s_addr, in.sin_port); }
