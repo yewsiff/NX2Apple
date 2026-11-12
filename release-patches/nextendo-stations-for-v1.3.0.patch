@@ -1,0 +1,80 @@
+diff --git a/dm/host/net_nextendo_apple.m b/dm/host/net_nextendo_apple.m
+index 91fe19d..4bc5851 100644
+--- a/dm/host/net_nextendo_apple.m
++++ b/dm/host/net_nextendo_apple.m
+@@ -652,7 +652,7 @@ static int trust_matches_pin(sec_trust_t trust, const char *sni) {
+     uint64_t sent, got;
+     NSMutableData *rhead;     // the server's HTTP head until its blank line
+     int rhead_done, nframes[2];
+-    struct { int have; uint8_t h[14]; uint64_t skip, len; int op, masked; uint8_t mask[4]; unsigned pos, capn; uint8_t cap[96]; } ws[2];   // 0: game → server, 1: server → game
++    struct { int have; uint8_t h[14]; uint64_t skip, len; int op, masked; uint8_t mask[4]; unsigned pos, capn; uint8_t cap[640]; } ws[2];   // 0: game → server, 1: server → game
+     int nnex, split[2];       // NEX calls logged so far; a split NEX message is passing in this direction
+     NSMutableData *cbody[2];  // a close frame's body while it passes
+     NSString *wsproto;        // the WebSocket subprotocol the game's request asks for ("NEX"); the server's answer must name it
+@@ -720,6 +720,22 @@ static const char *nex_protocol(unsigned p) {
+     }
+ }
+ static uint32_t le32(const uint8_t *b) { return (uint32_t)b[0] | (uint32_t)b[1] << 8 | (uint32_t)b[2] << 16 | (uint32_t)b[3] << 24; }
++// The station URLs in a message, logged as they stand. They are plain strings in the payload ("address=...;port=...;type=...;Pa=..."), and they
++// are the whole of what a server has to work with when it pairs a private candidate with a public one for a hole punch: which addresses and
++// ports the game registers for itself, and which ones it is given for the other player. Nothing else in these messages is read
++static void nex_stations(const uint8_t *b, unsigned n, const char *what) {
++    for (unsigned i = 0; i + 8 < n; i++) {
++        if (memcmp(b + i, "address=", 8)) continue;
++        unsigned s0 = i;
++        while (s0 && b[s0 - 1] >= 0x20 && b[s0 - 1] < 0x7f) s0--;   // back to the start of the printable run (the scheme, "prudps:/")
++        unsigned e = i;
++        while (e < n && b[e] >= 0x20 && b[e] < 0x7f) e++;
++        char t[256]; unsigned len = e - s0 < sizeof t - 1 ? e - s0 : (unsigned)sizeof t - 1;
++        memcpy(t, b + s0, len); t[len] = 0;
++        LOG("[nextendo] station URL (%s): %s", what, t);
++        i = e;
++    }
++}
+ // 1 when a line was written. b: the first n bytes of the frame's payload (unmasked), total: the payload's whole length. *split: a split message is passing
+ static int nex_note(const uint8_t *b, unsigned n, uint64_t total, int dir, int *split, int quiet) {
+     const char *who = dir ? "server → game" : "game → server";
+@@ -750,14 +766,28 @@ static int nex_note(const uint8_t *b, unsigned n, uint64_t total, int dir, int *
+             LOG("[nextendo] NEX: the game reports a hole punch to another player: %s, round trip %u ms", body[4] ? "it worked" : "FAILED", le32(body + (method == 7 ? 9 : 5)));
+             return 1;
+         }
++        // Where the addresses for a hole punch are settled: the game's own stations at secure connection Register (1) and ReplaceURL (7), and
++        // the other player's at match making GetSessionURLs (0x15 method 41)
++        if ((proto == 0x0b && (method == 1 || method == 7)) || (proto == 0x15 && method == 41)) {
++            NXLOG("NEX: %s call %u: %s %#x method %u (%llu bytes)", who, id, nex_protocol(proto), proto, method, (unsigned long long)total);
++            nex_stations(body, bl, proto == 0x0b ? "the game registers its own" : "asked for");
++            return 1;
++        }
+         if (quiet && proto != 3) return 0;
+         NXLOG("NEX: %s call %u: %s %#x method %u (%llu bytes)", who, id, nex_protocol(proto), proto, method, (unsigned long long)total);
+         return 1;
+     }
+     if (left < at + 1) return 0;
+     if (m[at]) {
+-        if (left < at + 9 || (quiet && proto != 3)) return 0;
+-        NXLOG("NEX: %s answer to call %u: %s %#x method %u (%llu bytes)", who, le32(m + at + 1), nex_protocol(proto), proto, le32(m + at + 5) & ~0x8000u, (unsigned long long)total);
++        if (left < at + 9) return 0;
++        unsigned method = le32(m + at + 5) & ~0x8000u;
++        if ((proto == 0x0b && (method == 1 || method == 7)) || (proto == 0x15 && method == 41)) {
++            NXLOG("NEX: %s answer to call %u: %s %#x method %u (%llu bytes)", who, le32(m + at + 1), nex_protocol(proto), proto, method, (unsigned long long)total);
++            nex_stations(m + at + 9, left - at - 9, proto == 0x15 ? "the server gives us for the session" : "the server kept for us");
++            return 1;
++        }
++        if (quiet && proto != 3) return 0;
++        NXLOG("NEX: %s answer to call %u: %s %#x method %u (%llu bytes)", who, le32(m + at + 1), nex_protocol(proto), proto, method, (unsigned long long)total);
+         return 1;
+     }
+     if (left < at + 9) return 0;
+diff --git a/docs/nextendo.md b/docs/nextendo.md
+index ad7c342..b75fc5a 100644
+--- a/docs/nextendo.md
++++ b/docs/nextendo.md
+@@ -28,7 +28,7 @@ runs offline exactly as before.
+ | NEX login | `dm/games/01006A800016E000/patches.py`, `hle_net.c` | gate `OBS_NEX_LOGIN` on the login job gives NEX's NgsFacade a direct server address, `10.13.37.1:443`, where NEX speaks its WebSocket without TLS |
+ | nn::ssl | `hle_net.c` | a connection's handshake on a socket connected to the game server swaps the bridge in for that socket, with the host name the game set; Read, Write, Peek and Poll are then the socket's. This is how Mario Kart 8 Deluxe's NEX client logs in, with no patch of the game |
+ | TLS bridge | `net_nextendo_apple.m`, `hle_net.c` | a TCP connection to `10.13.37.1`, or to the game server on the port its station URL names, is a local socket whose other end goes to the server in TLS (Network.framework), the server's key checked against the pins of `DM_NEXTENDO_PIN`, the `Host` header rewritten. Port 443 on the server is the game's own HTTPS and is left plain: `nn::ssl`'s handshake puts the bridge in its place with the name the game set, and if the game writes in clear there instead, its first bytes bring the bridge in |
+-| Diagnostics | `net_nextendo_apple.m`, `hle_net.c`, `hle_offline.c`, the game's `patches.py` | with `DM_NEXTENDO_LOG=1`: each NEX call that crosses the bridge by protocol and method number, a failed call's result code, what the game reports of its NAT and of each hole punch; every datagram socket's totals at its close and the NAT check's probes and replies; every failure the game records in an `ErrorResultVariant`; and gate `OBS_PIA_FAIL` (Smash 13.0.5) logs each Pia job that fails with its result. No station URL, token, name or player id is read |
++| Diagnostics | `net_nextendo_apple.m`, `hle_net.c`, `hle_offline.c`, the game's `patches.py` | with `DM_NEXTENDO_LOG=1`: each NEX call that crosses the bridge by protocol and method number, the station URLs the game registers for itself and the ones it is given for a session (secure connection 1 and 7, match making 41), a failed call's result code, what the game reports of its NAT and of each hole punch; every datagram socket's totals at its close and the NAT check's probes and replies; every failure the game records in an `ErrorResultVariant`; and gate `OBS_PIA_FAIL` (Smash 13.0.5) logs each Pia job that fails with its result. No station URL, token, name or player id is read |
+ 
+ ## Mario Kart 8 Deluxe
+ 

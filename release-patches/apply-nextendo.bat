@@ -28,6 +28,7 @@ call :one nextendo-udplog-for-v1.3.0 sk_trace_wb dm\host\hle_net.c || exit /b 1
 call :one nextendo-ssl443-for-v1.3.0 bridge_take dm\host\hle_net.c || exit /b 1
 call :one nextendo-diag-for-v1.3.0 atomic_exchange dm\host\hle_offline.c || exit /b 1
 call :one nextendo-ownaddr-for-v1.3.0 getifaddrs dm\host\net_nextendo_apple.m || exit /b 1
+call :one nextendo-stations-for-v1.3.0 nex_stations dm\host\net_nextendo_apple.m || exit /b 1
 echo.
 echo All Nextendo patches are in. Rebuild the game in the launcher.
 exit /b 0
