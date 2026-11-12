@@ -1,0 +1,77 @@
+@echo off
+rem Applies the Nextendo patches to the engine the NX2Apple v1.3.0 Windows release bundles, in order, skipping any already applied.
+rem Run it from the engine folder: ...\NX2Apple-windows-x64\NX2Apple\engine
+rem Run it as:  apply-nextendo.bat report   to be told the state of every patch without changing a file.
+setlocal
+if /i "%~1"=="report" set REPORT=1
+if not exist dm\host\hle_net.c (
+  echo Run this from the engine folder, e.g. C:\Users\you\Downloads\NX2Apple-windows-x64\NX2Apple\engine
+  exit /b 1
+)
+set BASE=https://raw.githubusercontent.com/yewsiff/NX2Apple/nextendo-online/release-patches
+rem Each line: the patch, and a marker that is already in the files when that patch is in.
+rem Markers are single tokens on purpose: quotes and parentheses inside the argument break cmd parsing.
+call :one nextendo-for-v1.3.0 NX_CLIENT_ID_DEFAULT dm\host\net_online.h || exit /b 1
+call :one nextendo-mk8-for-v1.3.0 nx_is_server dm\host\net_online.h || exit /b 1
+call :one nextendo-winbuild-for-v1.3.0 net_nextendo_apple.m dm\host\web_apple.m || exit /b 1
+call :one nextendo-bridgelog-for-v1.3.0 logHead dm\host\net_nextendo_apple.m || exit /b 1
+call :one nextendo-wsfix-for-v1.3.0 ws_fix_answer dm\host\net_nextendo_apple.m || exit /b 1
+call :one nextendo-trace-for-v1.3.0 ws_fix_accept dm\host\net_nextendo_apple.m || exit /b 1
+call :one nextendo-fd3-for-v1.3.0 SK_FD_FIRST dm\host\hle_net.c || exit /b 1
+call :one nextendo-errno-for-v1.3.0 sk_err_linux dm\host\hle_net.c || exit /b 1
+call :one nextendo-secure-for-v1.3.0 uint16_t dm\host\net_online.h || exit /b 1
+call :one nextendo-udp-for-v1.3.0 park_take dm\host\hle_net.c || exit /b 1
+call :one nextendo-piatrace-for-v1.3.0 rawn dm\host\net_nextendo_apple.m || exit /b 1
+call :one nextendo-ioctl-for-v1.3.0 on_ioctl dm\host\hle_net.c || exit /b 1
+call :one nextendo-nifmtrace-for-v1.3.0 resolver_called dm\host\hle_net.c || exit /b 1
+call :one nextendo-nsd-for-v1.3.0 nsd_resolve_online dm\host\hle_misc.c || exit /b 1
+call :one nextendo-match-for-v1.3.0 sk_opt_host dm\host\hle_net.c || exit /b 1
+call :one nextendo-udplog-for-v1.3.0 sk_trace_wb dm\host\hle_net.c || exit /b 1
+call :one nextendo-ssl443-for-v1.3.0 bridge_take dm\host\hle_net.c || exit /b 1
+call :one nextendo-diag-for-v1.3.0 atomic_exchange dm\host\hle_offline.c || exit /b 1
+call :one nextendo-ownaddr-for-v1.3.0 getifaddrs dm\host\net_nextendo_apple.m || exit /b 1
+call :one nextendo-stations-for-v1.3.0 nex_stations dm\host\net_nextendo_apple.m || exit /b 1
+call :one nextendo-stationbytes-for-v1.3.0 differently dm\host\net_nextendo_apple.m || exit /b 1
+call :one nextendo-icmp-for-v1.3.0 sk_udp_icmp dm\host\hle_net.c || exit /b 1
+call :one nextendo-authbind-for-v1.3.0 nex_login_note dm\host\net_nextendo_apple.m || exit /b 1
+if defined REPORT (echo. ^& echo That was a report: nothing was changed.) else (echo. ^& echo All Nextendo patches are in. Rebuild the game in the launcher.)
+exit /b 0
+
+rem %1 patch name, %2 a marker token, %3 the file it appears in once the patch is applied
+:one
+rem Whether a patch is in is asked of the patch itself, not of a marker word: a marker says nothing about
+rem the files it does not sit in, so an update that refreshes some engine files and keeps others left a tree
+rem that no marker could describe. Reversing a patch only checks out when every one of its changes is present.
+curl -sSL -o "%TEMP%\%1.patch" %BASE%/%1.patch
+if errorlevel 1 (
+  echo %1: download failed
+  exit /b 1
+)
+git apply --check -R --ignore-whitespace "%TEMP%\%1.patch" 2>nul
+if not errorlevel 1 (
+  echo %1: already applied
+  exit /b 0
+)
+git apply --check --ignore-whitespace "%TEMP%\%1.patch" 2>nul
+if errorlevel 1 goto :mixed
+if defined REPORT (
+  echo %1: NOT applied, and applies cleanly
+  exit /b 0
+)
+git apply --ignore-whitespace "%TEMP%\%1.patch" 2>nul
+if not errorlevel 1 (
+  echo %1: applied
+  exit /b 0
+)
+echo %1: FAILED to apply, the lines below say why
+git apply --ignore-whitespace --verbose "%TEMP%\%1.patch"
+exit /b 1
+
+:mixed
+rem Neither wholly in nor wholly out: some of this patch's files carry its changes and some do not, which is
+rem what an engine update leaves behind when it refreshes only the files that changed upstream.
+echo %1: PART of it is already in and part is not -- this engine folder is half patched
+echo     The files below say which is which. The cure is a clean engine folder: delete this one,
+echo     extract the engine folder from the NX2Apple download again, and run this script once.
+git apply --check --ignore-whitespace --verbose "%TEMP%\%1.patch" 2>&1 | findstr /c:"Checking patch" /c:"does not apply" /c:"error:"
+exit /b 1
