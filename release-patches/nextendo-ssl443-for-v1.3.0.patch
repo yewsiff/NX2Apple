@@ -1,0 +1,140 @@
+diff --git a/dm/host/hle_net.c b/dm/host/hle_net.c
+index 574d397..f989198 100644
+--- a/dm/host/hle_net.c
++++ b/dm/host/hle_net.c
+@@ -74,7 +74,7 @@ enum { EFD_MAX = 64, SK_POLLIN = 1, SK_POLLOUT = 4, SK_POLLRDNORM = 0x40, SK_POL
+ // One table for every descriptor the host hands out, so their numbers never clash: an event descriptor (host < 0), or online a socket (host is the
+ // host's own socket, always non-blocking at the host; nonblock is the game's own setting). Online, an event descriptor also has a pipe that holds
+ // one byte while its count is not zero (pr / pw), so a host poll can wait on it beside the sockets
+-static struct { uint64_t count; int used, flags; int host, pr, pw, type, nonblock, bridge, bport; int64_t rcv_ms, snd_ms; uint32_t ntx, nrx, nfail; int wb; } g_efd[EFD_MAX];
++static struct { uint64_t count; int used, flags; int host, pr, pw, type, nonblock, bridge, bport; int64_t rcv_ms, snd_ms; uint32_t ntx, nrx, nfail; int wb, undecided; } g_efd[EFD_MAX];
+ static pthread_mutex_t g_efd_m = PTHREAD_MUTEX_INITIALIZER;
+ static pthread_cond_t g_efd_c = PTHREAD_COND_INITIALIZER;
+ static int efd_used(int fd) { return fd >= 0 && fd < EFD_MAX && g_efd[fd].used && g_efd[fd].host < 0; }   // with g_efd_m held: an event descriptor
+@@ -305,13 +305,15 @@ static int sk_is_udp(int fd) { pthread_mutex_lock(&g_efd_m); int u = sk_used(fd)
+ // A 16-byte datagram to or from a NAT check server, as Nextendo's responder documents it (nextendo-nncs, main.go): four big-endian
+ // words, a probe {test id, -, -, local IP} and its reply {test id, the port and the address the server saw us from, the server's}
+ static void nat_note(const char *what, const void *b, long n, uint32_t ip_net, uint16_t port_net) {
++    // The ports a Ryujinx-Nextendo trace of a working check shows: five 16-byte probes to 33334, which nothing answers and whose silence is the
++    // filtering test, then ten to the game server on 10025 and five to the NAT check server on 10025, answered from both
+     uint16_t port = ntohs(port_net);
+-    if (!nx_log_on() || n != 16 || (port != 10025 && port != 10125)) return;
++    if (!nx_log_on() || n != 16 || (port != 10025 && port != 10125 && port != 33334 && port != 33335)) return;
+     const uint8_t *p = b;
+     uint32_t w[4];
+     for (int i = 0; i < 4; i++) w[i] = (uint32_t)p[4 * i] << 24 | (uint32_t)p[4 * i + 1] << 16 | (uint32_t)p[4 * i + 2] << 8 | p[4 * i + 3];
+     char d[24];
+-    if (*what == 'p') NXLOG("NAT check: probe %u to %s (our address in it %u.%u.%u.%u)", w[0], ip_str(ip_net, port_net, d), w[3] >> 24, w[3] >> 16 & 255, w[3] >> 8 & 255, w[3] & 255);
++    if (*what == 'p') NXLOG("NAT check: probe %u to %s%s (our address in it %u.%u.%u.%u)", w[0], ip_str(ip_net, port_net, d), port == 33334 || port == 33335 ? ", which is meant to go unanswered" : "", w[3] >> 24, w[3] >> 16 & 255, w[3] >> 8 & 255, w[3] & 255);
+     else NXLOG("NAT check: reply %u from %s: it saw us as %u.%u.%u.%u:%u", w[0], ip_str(ip_net, port_net, d), w[2] >> 24, w[2] >> 16 & 255, w[2] >> 8 & 255, w[2] & 255, w[1]);
+ }
+ static int bridge_fd(int fd) { pthread_mutex_lock(&g_efd_m); int b = sk_used(fd) && g_efd[fd].bridge; pthread_mutex_unlock(&g_efd_m); return b; }
+@@ -386,6 +388,17 @@ static void in_to(const struct sockaddr_in *in, void *a, unsigned *n) {   // and
+     memcpy(a, &g, *n < sizeof g ? *n : sizeof g);
+     *n = sizeof g;
+ }
++// The bridge takes a connected descriptor's place: from here on the game reads and writes plain bytes that go to the server in TLS. 0, or -1 with
++// the game's errno set
++static int bridge_take(int fd, int h, const char *sni, int rewrite_host, uint16_t port) {
++    int b = nx_bridge_open(sni, rewrite_host, port);
++    if (b < 0) return on_err(ECONNREFUSED);
++    if (dup2(b, h) < 0) { int e = errno; close(b); return on_err(e); }
++    close(b);
++    fcntl(h, F_SETFL, fcntl(h, F_GETFL) | O_NONBLOCK);
++    pthread_mutex_lock(&g_efd_m); if (sk_used(fd)) { g_efd[fd].bridge = 1; g_efd[fd].undecided = 0; } pthread_mutex_unlock(&g_efd_m);
++    return 0;
++}
+ static int on_connect(int fd, const void *a, unsigned n) {
+     int nb, type; int h = on_host(fd, &nb, &type, NULL, NULL);
+     if (h < 0) return -1;
+@@ -394,19 +407,30 @@ static int on_connect(int fd, const void *a, unsigned n) {
+     uint32_t ip = ntohl(in.sin_addr.s_addr);
+     { char d[24]; BTRACE(fd, "socket %d: connect %s (%s)", fd, ip_str(in.sin_addr.s_addr, in.sin_port, d), type == SK_SOCK_DGRAM ? "UDP" : "TCP"); }
+     if (!nx_dest_allowed(ip, type == SK_SOCK_DGRAM)) { NXLOG("socket %d: connect to %08x refused (not a Nextendo server)", fd, ip); return on_err(ECONNREFUSED); }
+-    // Every TCP connection to Nextendo goes out in TLS, the server's key pinned: the stand-in address (the NEX login the observation gate
+-    // points there) and the game server itself (the secure connection after the login, whose station URL names the server's host and its own
+-    // port; the game dials it in clear, as its login went). The bridge takes the descriptor's place either way
+-    if (type == SK_SOCK_STREAM && (ip == NX_BRIDGE_IP || nx_is_server(ip))) {
+-        int b = nx_bridge_open(NULL, 1, ip == NX_BRIDGE_IP ? 0 : ntohs(in.sin_port));
+-        if (b < 0) return on_err(ECONNREFUSED);
+-        if (dup2(b, h) < 0) { int e = errno; close(b); return on_err(e); }
+-        close(b);
+-        fcntl(h, F_SETFL, fcntl(h, F_GETFL) | O_NONBLOCK);
+-        pthread_mutex_lock(&g_efd_m); if (sk_used(fd)) g_efd[fd].bridge = 1; pthread_mutex_unlock(&g_efd_m);
+-        NXLOG("socket %d: NEX login through the bridge", fd);
++    // A TCP connection to Nextendo goes out in TLS with the server's key pinned, but only where the game speaks in clear. Its NEX goes to the
++    // stand-in address the observation gate set, and after the login to the port that connection's station URL names (51.178.29.194:60005 for
++    // Super Smash Bros. Ultimate); both speak plain WebSocket, so the bridge takes the descriptor's place at once, as it always has.
++    //
++    // Port 443 on the server is the game's own HTTPS, carrying its own TLS through nn::ssl: before each online action it asks the account API
++    // (api-lp1.znc.srv.nintendo.net, which their router fronts at the same address — a Ryujinx-Nextendo trace of a working arena join and a
++    // working Quickplay has it each time). Bridging that here hid the server from the handshake that follows, which then refused the socket for
++    // not being connected to the game server, so the request never went out. It is left plain for nn::ssl to put the bridge in its place with
++    // the name the game set. Should the game turn out to speak in clear on 443 after all (a station URL on that port), the first thing it
++    // writes brings the bridge in (on_send)
++    if (type == SK_SOCK_STREAM && ip == NX_BRIDGE_IP) {
++        if (bridge_take(fd, h, NULL, 1, 0)) return -1;
++        NXLOG("socket %d: the NEX login goes through the bridge", fd);
+         return 0;
+     }
++    if (type == SK_SOCK_STREAM && nx_is_server(ip) && ntohs(in.sin_port) != 443) {
++        if (bridge_take(fd, h, NULL, 1, ntohs(in.sin_port))) return -1;
++        NXLOG("socket %d: the NEX secure connection to port %u goes through the bridge", fd, ntohs(in.sin_port));
++        return 0;
++    }
++    if (type == SK_SOCK_STREAM && nx_is_server(ip)) {
++        pthread_mutex_lock(&g_efd_m); if (sk_used(fd)) g_efd[fd].undecided = 1; pthread_mutex_unlock(&g_efd_m);
++        NXLOG("socket %d: connecting to the game server on 443 in clear; whichever of nn::ssl or the game's first bytes comes first decides whether the bridge carries it", fd);
++    }
+     if (!connect(h, (struct sockaddr *)&in, sizeof in)) return 0;
+     if (errno != EINPROGRESS) return on_err(errno);
+     if (nb) return on_err(EINPROGRESS);
+@@ -506,6 +530,21 @@ static long on_send(int fd, const void *b, unsigned long len, int flags, const v
+         if (!in_of(a, al, &in)) return on_err(EAFNOSUPPORT);
+         if (!nx_dest_allowed(ntohl(in.sin_addr.s_addr), 1)) return on_err(EHOSTUNREACH);
+     }
++    // The first bytes on a connection left plain to the server (on_connect, port 443) say whether the game is carrying its own TLS: a handshake
++    // record, 0x16 and the version's major byte 0x03, means it is, and the bridge stays out of a connection that is already in TLS end to end.
++    // Anything else is in clear and wants the bridge, which is what an nn::ssl handshake would have brought in had the game made one
++    if (len) {
++        int un = 0;
++        pthread_mutex_lock(&g_efd_m); if (sk_used(fd) && g_efd[fd].undecided) { un = 1; g_efd[fd].undecided = 0; } pthread_mutex_unlock(&g_efd_m);
++        if (un) {
++            const uint8_t *p = b;
++            if (len >= 3 && p[0] == 0x16 && p[1] == 0x03) NXLOG("socket %d: the game carries its own TLS here, so the bridge stays out of it", fd);
++            else {
++                NXLOG("socket %d: the game writes in clear here, so the bridge takes the connection", fd);
++                if (bridge_take(fd, h, NULL, 1, 443)) return -1;
++            }
++        }
++    }
+     for (;;) {
+         ssize_t r = to ? sendto(h, b, len, flags, (struct sockaddr *)&in, sizeof in) : send(h, b, len, flags);
+         if (type == SK_SOCK_DGRAM && (r >= 0 || errno != EAGAIN)) { int e = errno; sk_count(fd, r >= 0 ? 0 : 2); errno = e; }
+diff --git a/dm/host/net_online.h b/dm/host/net_online.h
+index a64e8b1..13c32cf 100644
+--- a/dm/host/net_online.h
++++ b/dm/host/net_online.h
+@@ -11,7 +11,8 @@
+ //   names     every name of Nintendo's the game resolves (nintendo.net, .com, .co.jp, nintendowifi.net) is Nextendo's: nncs2-* (Pia's second
+ //             NAT check server) is their NAT check, every other one their game server. Nothing else resolves
+ //   TLS       nn::ssl: a connection's handshake on a socket connected to the game server puts the bridge in the socket's place, so the game's
+-//             own TLS client (NEX over nn::ssl: Mario Kart 8 Deluxe) reads and writes plain bytes the bridge carries in TLS, the key pinned
++//             own TLS client (NEX over nn::ssl: Mario Kart 8 Deluxe; the account API every game asks before an online action) reads and
++//             writes plain bytes the bridge carries in TLS, the key pinned. So a connection to the server on 443 is left plain for it
+ //   NEX       (Super Smash Bros. Ultimate) the game's NEX client is pointed at a stand-in address (NX_BRIDGE_IP, observation gate OBS_NEX_LOGIN on its login job) where it
+ //             speaks its WebSocket without TLS; a TCP connection there is a bridge that carries it to Nextendo's game server in TLS, the
+ //             server's key pinned (Network.framework). Pia's UDP goes straight to the other players, as on a console
+diff --git a/docs/nextendo.md b/docs/nextendo.md
+index aa6b2ef..6637555 100644
+--- a/docs/nextendo.md
++++ b/docs/nextendo.md
+@@ -27,7 +27,7 @@ runs offline exactly as before.
+ | nifm | `hle_net.c`, `hle_offline.c` | the network is available; the IP configuration is the host's |
+ | NEX login | `dm/games/01006A800016E000/patches.py`, `hle_net.c` | gate `OBS_NEX_LOGIN` on the login job gives NEX's NgsFacade a direct server address, `10.13.37.1:443`, where NEX speaks its WebSocket without TLS |
+ | nn::ssl | `hle_net.c` | a connection's handshake on a socket connected to the game server swaps the bridge in for that socket, with the host name the game set; Read, Write, Peek and Poll are then the socket's. This is how Mario Kart 8 Deluxe's NEX client logs in, with no patch of the game |
+-| TLS bridge | `net_nextendo_apple.m` | a TCP connection to `10.13.37.1` is a local socket whose other end goes to the game server in TLS (Network.framework), the server's key checked against the pins of `DM_NEXTENDO_PIN`, the `Host` header rewritten |
++| TLS bridge | `net_nextendo_apple.m`, `hle_net.c` | a TCP connection to `10.13.37.1`, or to the game server on the port its station URL names, is a local socket whose other end goes to the server in TLS (Network.framework), the server's key checked against the pins of `DM_NEXTENDO_PIN`, the `Host` header rewritten. Port 443 on the server is the game's own HTTPS and is left plain: `nn::ssl`'s handshake puts the bridge in its place with the name the game set, and if the game writes in clear there instead, its first bytes bring the bridge in |
+ | Diagnostics | `net_nextendo_apple.m`, `hle_net.c`, `hle_offline.c`, the game's `patches.py` | with `DM_NEXTENDO_LOG=1`: each NEX call that crosses the bridge by protocol and method number, a failed call's result code, what the game reports of its NAT and of each hole punch; every datagram socket's totals at its close and the NAT check's probes and replies; every failure the game records in an `ErrorResultVariant`; and gate `OBS_PIA_FAIL` (Smash 13.0.5) logs each Pia job that fails with its result. No station URL, token, name or player id is read |
+ 
+ ## Mario Kart 8 Deluxe

@@ -101,3 +101,4 @@
 0136-nextendo-nsd-resolve.patch
 0137-nextendo-socket-numbers-and-match-trace.patch
 0138-nextendo-udp-log-and-pins.patch
+0139-nextendo-ssl-443-passthrough.patch
