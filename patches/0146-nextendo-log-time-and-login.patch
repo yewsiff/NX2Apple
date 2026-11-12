@@ -1,0 +1,410 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: yewsifofficial <yewsifofficial@gmail.com>
+Date: Thu, 12 Nov 2026 15:32:54 -0500
+Subject: [PATCH] nextendo: stamp every line with the time, and read the login
+ this game sends
+
+The working emulator's trace and ours now agree on everything that can be
+counted. Its NAT check and ours are the same twenty datagrams and ten
+replies, split the same way between the two responders. Its sockets are
+parked and adopted in the same order as ours, it reports the same errno
+value for a read with nothing to read, and it is handed the same peer we
+are. The one thing left to compare is when each step happened: after its
+three datagrams to the sinkhole it polls an empty socket for another 0.96
+seconds and only then reaches the peer, while this engine gives up somewhere
+in that second. That emulator's log is stamped to the millisecond and ours
+carried no time at all, so the comparison could not be made.
+
+So every Nextendo line now opens with the milliseconds since the first one.
+The clock is monotonic and the start is the first line of the run, which is
+what makes two traces of the same minute lie flat against each other.
+
+The login decoder also covered the wrong methods. This game logs in with
+ticket granting method 6, LoginWithContext, and only 1, 2 and 3 were read,
+so the one message that says who the server thinks we are went past
+unexamined. Method 6 wraps the username in a structure rather than opening
+with it, so the PID is now looked for as the digits it is written as,
+anywhere in the body, which holds for either shape. Checked against vectors
+built the way the server builds them, in both shapes, with and without the
+nnex claim and with a PID that is not ours.
+
+Upstream-Status: fork-only (online play is out of nxnative's scope)
+Reason: Nextendo online play for Super Smash Bros. Ultimate
+Issue: yewsiff/NX2Apple (no tracker: issues are disabled on this fork)
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_017xdHQoEipBX2wTqN8BNnMv
+---
+ dm/host/hle_net.c            |   6 +-
+ dm/host/hle_offline.c        |   4 +-
+ dm/host/net_nextendo_apple.m | 110 +++++++++++++++++++----------------
+ dm/host/net_online.h         |   7 ++-
+ 4 files changed, 71 insertions(+), 56 deletions(-)
+
+diff --git a/dm/host/hle_net.c b/dm/host/hle_net.c
+index c8bc563..cbbe9b9 100644
+--- a/dm/host/hle_net.c
++++ b/dm/host/hle_net.c
+@@ -853,7 +853,7 @@ static void obs_nex_login(uint64_t *regs, int param) {
+     char *data = *(char **)(facade + 576 + 24);
+     uint64_t cap = *(uint64_t *)(facade + 576 + 32);
+     const char host[] = "10.13.37.1";   // NX_BRIDGE_IP
+-    if (!data || cap <= strlen(host)) { LOG("[nextendo] NEX login: no room for the bridge's address; the game's own server is left, and its login fails"); return; }
++    if (!data || cap <= strlen(host)) { NXLOGA("NEX login: no room for the bridge's address; the game's own server is left, and its login fails"); return; }
+     memcpy(data, host, sizeof host);
+     *(uint16_t *)(facade + 616) = NX_BRIDGE_PORT;
+     NXLOG("NEX login through the bridge");
+@@ -874,8 +874,8 @@ static void obs_pia_fail(uint64_t *regs, int param) {
+     uint32_t r = regs[1] > 0x10000 && !(regs[1] & 3) ? *(const uint32_t *)regs[1] : 0;
+     const void *lr = (const void *)regs[30];
+     module_t *m = module_of(lr);
+-    if (m) LOG("[nextendo] a Pia job failed: result %u (%#x), from %s+%#llx", r, r, m->name, (unsigned long long)((const uint8_t *)lr - m->base));
+-    else LOG("[nextendo] a Pia job gate fired (x0 %#llx, x1 %#llx, x30 %#llx: no caller inside a module, so these are not the job and its result — the gate's address wants checking on this build)",
++    if (m) NXLOGA("a Pia job failed: result %u (%#x), from %s+%#llx", r, r, m->name, (unsigned long long)((const uint8_t *)lr - m->base));
++    else NXLOGA("a Pia job gate fired (x0 %#llx, x1 %#llx, x30 %#llx: no caller inside a module, so these are not the job and its result — the gate's address wants checking on this build)",
+              (unsigned long long)regs[0], (unsigned long long)regs[1], (unsigned long long)regs[30]);
+ }
+ __attribute__((constructor)) static void net_obs_init(void) { gate_obs_set(OBS_NEX_LOGIN, obs_nex_login); gate_obs_set(OBS_PIA_FAIL, obs_pia_fail); }
+diff --git a/dm/host/hle_offline.c b/dm/host/hle_offline.c
+index 597faf2..df41eff 100644
+--- a/dm/host/hle_offline.c
++++ b/dm/host/hle_offline.c
+@@ -221,8 +221,8 @@ static void *err_variant_pass(void *v, const uint32_t *a, const char *sym, void
+     static _Atomic uint64_t last;   // the game records the same ordinary result over and over while all is well; a run of one code is logged once
+     uint64_t this = (uint64_t)code << 62 | (uint64_t)w1 << 32 | w0;
+     if ((w0 || w1) && dm_net_online() && atomic_exchange(&last, this) != this && atomic_fetch_add(&n, 1) < 200) {
+-        if (code) LOG("[nextendo] the game records a failure: error code %04u-%04u", w0, w1);
+-        else LOG("[nextendo] the game records a failure: result %#x = %04u-%04u", w0, 2000 + (w0 & 0x1ff), (w0 >> 9) & 0x1fff);
++        if (code) NXLOGA("the game records a failure: error code %04u-%04u", w0, w1);
++        else NXLOGA("the game records a failure: result %#x = %04u-%04u", w0, 2000 + (w0 & 0x1ff), (w0 >> 9) & 0x1fff);
+     }
+     if (*orig) return (*orig)(v, a);
+     if (v) { uint32_t *o = v; o[0] = code ? 2 : 1; o[1] = w0; if (code) o[2] = w1; }   // (no definition to call: the Result form as above, the ErrorCode form by the next state)
+diff --git a/dm/host/net_nextendo_apple.m b/dm/host/net_nextendo_apple.m
+index 60f28ee..254f42c 100644
+--- a/dm/host/net_nextendo_apple.m
++++ b/dm/host/net_nextendo_apple.m
+@@ -118,15 +118,15 @@ static void cfg_init(void) {
+     if (colon) { *colon = 0; int p = atoi(colon + 1); if (p > 0 && p < 65536) C.server_port = (uint16_t)p; }
+     int ok = parse_ip(srv, &C.server) && parse_ip(env("DM_NEXTENDO_NAT", NX_NAT_DEFAULT), &C.nat) && parse_pins(env("DM_NEXTENDO_PIN", NX_PIN_DEFAULT));
+     if (!asked) return;
+-    if (!C.game) { LOG("[nextendo] DM_NEXTENDO=1, but this game (%s) is not one the host takes online: it stays offline", id); return; }
+-    if (!ok) { LOG("[nextendo] DM_NEXTENDO_SERVER, DM_NEXTENDO_NAT or DM_NEXTENDO_PIN is not valid: offline"); return; }
++    if (!C.game) { NXLOGA("DM_NEXTENDO=1, but this game (%s) is not one the host takes online: it stays offline", id); return; }
++    if (!ok) { NXLOGA("DM_NEXTENDO_SERVER, DM_NEXTENDO_NAT or DM_NEXTENDO_PIN is not valid: offline"); return; }
+     if (!strncmp(C.api, "http://", 7)) {   // only a local test server may go without TLS
+         uint32_t ip; char h[64]; snprintf(h, sizeof h, "%s", C.api + 7);
+         char *e = strpbrk(h, ":/"); if (e) *e = 0;
+-        if (!parse_ip(h, &ip) || (ip >> 24) != 127) { LOG("[nextendo] DM_NEXTENDO_API must be https (or a loopback http test server): offline"); return; }
++        if (!parse_ip(h, &ip) || (ip >> 24) != 127) { NXLOGA("DM_NEXTENDO_API must be https (or a loopback http test server): offline"); return; }
+     }
+     C.online = 1;
+-    LOG("[nextendo] online through Nextendo Network: account API %s, game server %s:%u (%s)%s", C.api, srv, C.server_port, C.game->host,
++    NXLOGA("online through Nextendo Network: account API %s, game server %s:%u (%s)%s", C.api, srv, C.server_port, C.game->host,
+         C.client_id[0] ? "" : "; no client ID yet (DM_NEXTENDO_CLIENT_ID): sign-in will fail");
+ }
+ int dm_net_online(void) { pthread_once(&g_cfg_once, cfg_init); return C.online; }
+@@ -228,7 +228,7 @@ static int kc_set(NSString *account, NSData *value) {
+         q[(__bridge id)kSecAttrAccessible] = (__bridge id)kSecAttrAccessibleAfterFirstUnlock;
+         st = SecItemAdd((__bridge CFDictionaryRef)q, NULL);
+     }
+-    if (st != errSecSuccess) LOG("[nextendo] could not keep %s in the Keychain (OSStatus %d)", account.UTF8String, (int)st);
++    if (st != errSecSuccess) NXLOGA("could not keep %s in the Keychain (OSStatus %d)", account.UTF8String, (int)st);
+     return st == errSecSuccess;
+ }
+ static void kc_del(NSString *account) { SecItemDelete((__bridge CFDictionaryRef)kc_query(account)); }
+@@ -292,7 +292,7 @@ static int http(NSString *method, NSString *url, NSString *bearer, NSString *for
+     dispatch_semaphore_t done = dispatch_semaphore_create(0);
+     NSURLSessionDataTask *t = [NSURLSession.sharedSession dataTaskWithRequest:rq completionHandler:^(NSData *d, NSURLResponse *r, NSError *e) {
+         if (!e && [r isKindOfClass:NSHTTPURLResponse.class]) { status = (int)((NSHTTPURLResponse *)r).statusCode; body = d; }
+-        else if (e) LOG("[nextendo] %s %s: %s", method.UTF8String, rq.URL.path.UTF8String, e.localizedDescription.UTF8String);
++        else if (e) NXLOGA("%s %s: %s", method.UTF8String, rq.URL.path.UTF8String, e.localizedDescription.UTF8String);
+         dispatch_semaphore_signal(done);
+     }];
+     [t resume];
+@@ -318,12 +318,12 @@ static struct {
+ static void acc_load(void) {   // with g_acc_m held
+     if (A.loaded) return;
+     A.loaded = 1;
+-    if (atoi(env("DM_NEXTENDO_SIGNOUT", "0"))) { kc_del(@"refresh_token"); kc_del(@"username"); LOG("[nextendo] signed out (DM_NEXTENDO_SIGNOUT)"); }
++    if (atoi(env("DM_NEXTENDO_SIGNOUT", "0"))) { kc_del(@"refresh_token"); kc_del(@"username"); NXLOGA("signed out (DM_NEXTENDO_SIGNOUT)"); }
+     A.refresh = kc_str(@"refresh_token");
+     A.username = kc_str(@"username");
+ }
+ static void acc_forget(const char *why) {   // with g_acc_m held: the stored account no longer works
+-    LOG("[nextendo] the stored account no longer signs in (%s): sign in again", why);
++    NXLOGA("the stored account no longer signs in (%s): sign in again", why);
+     kc_del(@"refresh_token"); A.refresh = nil; A.access = nil; A.nex = nil; A.pid = 0;
+ }
+ // Keep what /oauth/token answered. 1 when it carried an access token
+@@ -410,12 +410,12 @@ static ASWebAuthenticationSession *g_sheet; static NxSheetAnchor *g_anchor;
+ 
+ // Shows the sign-in page and waits for the redirect. With g_acc_m held. 1 when signed in
+ static int sign_in(void) {
+-    if (!C.client_id[0]) { LOG("[nextendo] no client ID: register an application at nextendo.network/developers and set DM_NEXTENDO_CLIENT_ID (docs/nextendo.md)"); return 0; }
++    if (!C.client_id[0]) { NXLOGA("no client ID: register an application at nextendo.network/developers and set DM_NEXTENDO_CLIENT_ID (docs/nextendo.md)"); return 0; }
+     int ls = socket(AF_INET, SOCK_STREAM, 0);
+     int one = 1; setsockopt(ls, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+     struct sockaddr_in a = {.sin_len = sizeof a, .sin_family = AF_INET, .sin_port = htons((uint16_t)C.redirect_port), .sin_addr.s_addr = htonl(INADDR_LOOPBACK)};
+     if (ls < 0 || bind(ls, (struct sockaddr *)&a, sizeof a) || listen(ls, 4)) {
+-        LOG("[nextendo] cannot listen on 127.0.0.1:%d for the sign-in redirect (%s)", C.redirect_port, strerror(errno));
++        NXLOGA("cannot listen on 127.0.0.1:%d for the sign-in redirect (%s)", C.redirect_port, strerror(errno));
+         if (ls >= 0) close(ls);
+         return 0;
+     }
+@@ -429,7 +429,7 @@ static int sign_in(void) {
+     int old = atomic_exchange(&g_listen_fd, ls);
+     if (old >= 0) close(old);
+     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{ listener_thread(ls); });
+-    LOG("[nextendo] sign in to Nextendo in the browser that opens");
++    NXLOGA("sign in to Nextendo in the browser that opens");
+     NSURL *u = [NSURL URLWithString:url];
+     dispatch_async(dispatch_get_main_queue(), ^{
+ #if TARGET_OS_IPHONE
+@@ -453,13 +453,13 @@ static int sign_in(void) {
+ #endif
+     NSString *code = g_got_code;
+     g_got_code = nil;
+-    if (!code.length) { LOG("[nextendo] sign-in not completed (%s)", timed_out ? "timed out" : g_got_error.UTF8String ?: "no code"); return 0; }
++    if (!code.length) { NXLOGA("sign-in not completed (%s)", timed_out ? "timed out" : g_got_error.UTF8String ?: "no code"); return 0; }
+     NSString *form = [NSString stringWithFormat:@"grant_type=authorization_code&client_id=%@&code=%@&redirect_uri=%@&code_verifier=%@",
+                       form_escape(@(C.client_id)), form_escape(code), form_escape(redirect), form_escape(verifier)];
+     NSDictionary *j = nil;
+     int st = token_request(form, &j);
+-    if (st != 200 || !take_tokens(j) || !A.refresh.length) { LOG("[nextendo] sign-in: the token exchange failed (HTTP %d%s%s)", st, jstr(j, @"error") ? ", " : "", jstr(j, @"error").UTF8String ?: ""); return 0; }
+-    LOG("[nextendo] signed in");
++    if (st != 200 || !take_tokens(j) || !A.refresh.length) { NXLOGA("sign-in: the token exchange failed (HTTP %d%s%s)", st, jstr(j, @"error") ? ", " : "", jstr(j, @"error").UTF8String ?: ""); return 0; }
++    NXLOGA("signed in");
+     return 1;
+ }
+ static int ensure_access(void) {   // with g_acc_m held
+@@ -469,7 +469,7 @@ static int ensure_access(void) {   // with g_acc_m held
+     int st = token_request([NSString stringWithFormat:@"grant_type=refresh_token&refresh_token=%@&client_id=%@", form_escape(A.refresh), form_escape(@(C.client_id))], &j);
+     if (st == 200 && take_tokens(j)) return 1;
+     if (st == 400 || st == 401) acc_forget(jstr(j, @"error").UTF8String ?: "refused");
+-    else LOG("[nextendo] could not refresh the sign-in (HTTP %d)", st);
++    else NXLOGA("could not refresh the sign-in (HTTP %d)", st);
+     return 0;
+ }
+ static int fetch_nex(void) {   // with g_acc_m held
+@@ -478,12 +478,12 @@ static int fetch_nex(void) {   // with g_acc_m held
+     NSString *nt = jstr(j, @"nex_token"), *un = jstr(j, @"username");
+     double pid = jnum(j, @"pid", 0);
+     if (st == 401) { A.access = nil; return 0; }
+-    if (st != 200 || !nt.length || pid <= 0 || nt.length > 1024) { LOG("[nextendo] no game token (HTTP %d)", st); return 0; }
+-    for (NSUInteger i = 0; i < nt.length; i++) { unichar ch = [nt characterAtIndex:i]; if (ch <= ' ' || ch == '"' || ch == '\\' || ch > 126) { LOG("[nextendo] the game token is not a token"); return 0; } }
++    if (st != 200 || !nt.length || pid <= 0 || nt.length > 1024) { NXLOGA("no game token (HTTP %d)", st); return 0; }
++    for (NSUInteger i = 0; i < nt.length; i++) { unichar ch = [nt characterAtIndex:i]; if (ch <= ' ' || ch == '"' || ch == '\\' || ch > 126) { NXLOGA("the game token is not a token"); return 0; } }
+     A.nex = nt; A.pid = (uint64_t)pid;
+     A.nex_exp = time(NULL) + (time_t)jnum(j, @"expires_in", 3600);
+     if (un.length && ![un isEqualToString:A.username]) { A.username = un; kc_set_str(@"username", un); }
+-    LOG("[nextendo] game token ready (%s)", A.username.UTF8String ?: "signed in");
++    NXLOGA("game token ready (%s)", A.username.UTF8String ?: "signed in");
+     return 1;
+ }
+ static int account_ready(void) {
+@@ -534,7 +534,7 @@ static int jwt_key_load(void) {   // with g_acc_m held
+         CFErrorRef e = NULL;
+         g_jwt_key = SecKeyCreateRandomKey((__bridge CFDictionaryRef)@{(__bridge id)kSecAttrKeyType: (__bridge id)kSecAttrKeyTypeRSA,
+                                                                       (__bridge id)kSecAttrKeySizeInBits: @2048}, &e);
+-        if (!g_jwt_key) { LOG("[nextendo] could not make the ID token's key"); if (e) CFRelease(e); return 0; }
++        if (!g_jwt_key) { NXLOGA("could not make the ID token's key"); if (e) CFRelease(e); return 0; }
+         CFDataRef ext = SecKeyCopyExternalRepresentation(g_jwt_key, NULL);
+         if (ext) { kc_set(@"jwt_key", (__bridge NSData *)ext); CFRelease(ext); }
+     }
+@@ -573,7 +573,7 @@ static size_t id_token_(char *out, size_t cap) {
+             CFRelease(sig);
+             const char *t = tok.UTF8String;
+             if (strlen(t) < cap) { memcpy(out, t, strlen(t) + 1); n = strlen(t); }
+-            else LOG("[nextendo] the ID token (%zu bytes) does not fit the game's buffer (%zu)", strlen(t), cap);
++            else NXLOGA("the ID token (%zu bytes) does not fit the game's buffer (%zu)", strlen(t), cap);
+         }
+     }
+     pthread_mutex_unlock(&g_acc_m);
+@@ -628,7 +628,7 @@ static int trust_matches_pin(sec_trust_t trust, const char *sni) {
+             if (!ok) {
+                 char hex[65]; const uint8_t *b = h.bytes;
+                 for (int i = 0; i < 32; i++) snprintf(hex + 2 * i, 3, "%02x", b[i]);
+-                LOG("[nextendo] the key %s presented is not one of the %d pinned: its SubjectPublicKeyInfo hashes to %s. Add it to DM_NEXTENDO_PIN (commas between pins) to allow it", sni && *sni ? sni : "the server", C.npin, hex);
++                NXLOGA("the key %s presented is not one of the %d pinned: its SubjectPublicKeyInfo hashes to %s. Add it to DM_NEXTENDO_PIN (commas between pins) to allow it", sni && *sni ? sni : "the server", C.npin, hex);
+             }
+         }
+     }
+@@ -679,7 +679,7 @@ static NSData *ws_fix_accept(NSData *head, NSString *key) {
+     if (!key.length || !got) return head;
+     NSString *want = ws_accept_for(key);
+     if ([got isEqualToString:want]) { NXLOG("bridge: the server's Sec-WebSocket-Accept is right for the game's key"); return head; }
+-    LOG("[nextendo] bridge: the server's Sec-WebSocket-Accept is wrong for the game's key: corrected");
++    NXLOGA("bridge: the server's Sec-WebSocket-Accept is wrong for the game's key: corrected");
+     NSString *s = [[NSString alloc] initWithData:head encoding:NSISOLatin1StringEncoding];
+     NSMutableArray *lines = [[s componentsSeparatedByString:@"\r\n"] mutableCopy];
+     for (NSUInteger i = 0; i < lines.count; i++)
+@@ -701,7 +701,7 @@ static NSData *ws_fix_answer(NSData *head, NSString *proto) {
+     NSString *s = [[NSString alloc] initWithData:head encoding:NSISOLatin1StringEncoding];
+     if (!proto.length || ![s hasPrefix:@"HTTP/1.1 101"] || [s.lowercaseString containsString:@"\r\nsec-websocket-protocol:"]) return head;
+     NSString *fixed = [[s substringToIndex:s.length - 2] stringByAppendingFormat:@"Sec-WebSocket-Protocol: %@\r\n\r\n", proto];
+-    LOG("[nextendo] bridge: the server's answer names no WebSocket subprotocol: %s added, as the game asked", proto.UTF8String);
++    NXLOGA("bridge: the server's answer names no WebSocket subprotocol: %s added, as the game asked", proto.UTF8String);
+     return [fixed dataUsingEncoding:NSISOLatin1StringEncoding];
+ }
+ // DM_NEXTENDO_LOG: which NEX calls cross the bridge, from the first bytes of each binary frame. A frame is a PRUDP Lite packet (as Nextendo's server
+@@ -733,7 +733,7 @@ static int nex_stations(const uint8_t *b, unsigned n, const char *what) {
+         while (e < n && b[e] >= 0x20 && b[e] < 0x7f) e++;
+         char t[256]; unsigned len = e - s0 < sizeof t - 1 ? e - s0 : (unsigned)sizeof t - 1;
+         memcpy(t, b + s0, len); t[len] = 0;
+-        LOG("[nextendo] station URL (%s): %s", what, t);
++        NXLOGA("station URL (%s): %s", what, t);
+         found++;
+         i = e;
+     }
+@@ -744,7 +744,7 @@ static int nex_stations(const uint8_t *b, unsigned n, const char *what) {
+         unsigned k = n < 48 ? n : 48;
+         for (unsigned i = 0; i < k; i++) { snprintf(hex + 3 * i, 4, "%02x ", b[i]); asc[i] = b[i] >= 0x20 && b[i] < 0x7f ? (char)b[i] : '.'; }
+         hex[3 * k] = 0; asc[k] = 0;
+-        LOG("[nextendo] no station URL in the %s message (%u bytes); its first %u: %s|%s", what, n, k, hex, asc);
++        NXLOGA("no station URL in the %s message (%u bytes); its first %u: %s|%s", what, n, k, hex, asc);
+     }
+     return found;
+ }
+@@ -778,23 +778,33 @@ static NSData *jwt_payload(const uint8_t *b, unsigned n) {
+     return nil;
+ }
+ static void nex_login_note(const uint8_t *b, unsigned bl, unsigned method) {
+-    char name[48] = "";
+-    unsigned len = bl >= 2 ? (b[0] | (unsigned)b[1] << 8) : 0;   // a NEX String: its length, then the bytes with their terminator
+-    if (len && 2u + len <= bl) {
+-        unsigned k = len && b[2 + len - 1] == 0 ? len - 1 : len;
+-        if (k >= sizeof name) k = sizeof name - 1;
+-        memcpy(name, b + 2, k); name[k] = 0;
+-        for (unsigned i = 0; i < k; i++) if (name[i] < 0x20 || name[i] >= 0x7f) name[i] = '.';
+-    }
+     uint64_t pid = nx_pid();
+-    char want[24]; snprintf(want, sizeof want, "%llu", (unsigned long long)pid);
++    char want[24]; int wn = snprintf(want, sizeof want, "%llu", (unsigned long long)pid);
++    // Login (1) and LoginEx (2) open with the username as a NEX String; LoginWithContext (6), which this game uses, wraps it in a structure
++    // instead. So the PID is looked for as the digits it is written as, anywhere in the body, which holds for either shape
++    int named = 0;
++    if (pid && wn > 0) for (unsigned i = 0; i + (unsigned)wn <= bl && !named; i++)
++        if (!memcmp(b + i, want, (size_t)wn) && (i == 0 || b[i - 1] < '0' || b[i - 1] > '9')
++            && (i + (unsigned)wn == bl || b[i + wn] < '0' || b[i + wn] > '9')) named = 1;
+     NSData *payload = jwt_payload(b, bl);
+-    const char *claim = payload.length ? strstr([[NSString alloc] initWithData:payload encoding:NSUTF8StringEncoding].UTF8String ?: "", "\"nnex\"") : NULL;
+-    LOG("[nextendo] NEX: the login names us %s%s; its ID token %s%s", name[0] ? name : "(no name)",
+-        pid && !strcmp(name, want) ? " (our Nextendo PID, as it must be)" : pid ? " -- NOT our Nextendo PID, which the server will refuse" : "",
+-        !payload.length ? "is MISSING, so the server cannot tie this login to an account" :
+-        claim ? "carries the signed Nextendo token, which is what proves the PID" : "carries NO nnex claim, so the server cannot tie this login to an account",
+-        method == 3 ? " (ValidateAndRequestTicket)" : method == 2 ? " (LoginEx)" : " (Login)");
++    NSString *txt = payload.length ? [[NSString alloc] initWithData:payload encoding:NSUTF8StringEncoding] : nil;
++    int claim = txt && strstr(txt.UTF8String ?: "", "\"nnex\"") != NULL;
++    NXLOGA("NEX: the login%s names our Nextendo PID %llu, and its ID token %s",
++           method == 6 ? " (LoginWithContext)" : method == 2 ? " (LoginEx)" : method == 3 ? " (RequestTicket)" : " (Login)",
++           (unsigned long long)pid,
++           !payload.length ? "is MISSING, so the server cannot tie this login to an account" :
++           claim ? "carries the signed Nextendo token, which is what proves the PID" :
++                   "carries NO nnex claim, so the server cannot tie this login to an account");
++    if (!named) NXLOGA("NEX: the login does NOT carry our PID %llu, which the server refuses", (unsigned long long)pid);
++}
++double nx_log_ms(void) {
++    static _Atomic double t0;
++    struct timespec ts;
++    clock_gettime(CLOCK_MONOTONIC, &ts);
++    double now = (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1e6;
++    double z = atomic_load(&t0);
++    if (z == 0) { atomic_store(&t0, now); z = now; }
++    return now - z;
+ }
+ static int nex_note(const uint8_t *b, unsigned n, uint64_t total, int dir, int *split, int quiet) {
+     const char *who = dir ? "server → game" : "game → server";
+@@ -818,14 +828,14 @@ static int nex_note(const uint8_t *b, unsigned n, uint64_t total, int dir, int *
+         uint32_t id = le32(m + at), method = le32(m + at + 4);
+         const uint8_t *body = m + at + 8; unsigned bl = left - at - 8;
+         if (proto == 3 && method == 5 && bl >= 12) {   // ReportNATProperties(mapping, filtering, round trip): what Pia's NAT check concluded
+-            LOG("[nextendo] NEX: the game reports its NAT to the server: mapping %u, filtering %u, round trip %u ms (mapping: 1 the same port to every server, 2 a port per server, 0 not found out; filtering: 1 open, 2 by port, 0 not found out)", le32(body), le32(body + 4), le32(body + 8));
++            NXLOGA("NEX: the game reports its NAT to the server: mapping %u, filtering %u, round trip %u ms (mapping: 1 the same port to every server, 2 a port per server, 0 not found out; filtering: 1 open, 2 by port, 0 not found out)", le32(body), le32(body + 4), le32(body + 8));
+             return 1;
+         }
+         if (proto == 3 && (method == 4 || method == 7) && bl >= (method == 7 ? 13u : 9u)) {   // ReportNATTraversalResult(station, ok, [detail,] round trip)
+-            LOG("[nextendo] NEX: the game reports a hole punch to another player: %s, round trip %u ms", body[4] ? "it worked" : "FAILED", le32(body + (method == 7 ? 9 : 5)));
++            NXLOGA("NEX: the game reports a hole punch to another player: %s, round trip %u ms", body[4] ? "it worked" : "FAILED", le32(body + (method == 7 ? 9 : 5)));
+             return 1;
+         }
+-        if (proto == 0x0a && (method == 1 || method == 2 || method == 3)) {   // the login: who the server is being told we are
++        if (proto == 0x0a && method >= 1 && method <= 6) {   // the login: who the server is being told we are. This game logs in with 6, LoginWithContext
+             NXLOG("NEX: %s call %u: %s %#x method %u (%llu bytes)", who, id, nex_protocol(proto), proto, method, (unsigned long long)total);
+             nex_login_note(body, bl, method);
+             return 1;
+@@ -855,7 +865,7 @@ static int nex_note(const uint8_t *b, unsigned n, uint64_t total, int dir, int *
+         return 1;
+     }
+     if (left < at + 9) return 0;
+-    LOG("[nextendo] NEX: %s call %u FAILED: %s %#x, result %#x", who, le32(m + at + 5), nex_protocol(proto), proto, le32(m + at + 1));   // always logged
++    NXLOGA("NEX: %s call %u FAILED: %s %#x, result %#x", who, le32(m + at + 5), nex_protocol(proto), proto, le32(m + at + 1));   // always logged
+     return 1;
+ }
+ // One direction's WebSocket frame headers, read as the bytes pass, and the first bytes of each binary frame for nex_note (the rest of a payload is skipped, never
+@@ -875,7 +885,7 @@ static int nex_note(const uint8_t *b, unsigned n, uint64_t total, int dir, int *
+                 const uint8_t *b = (*cb).bytes; NSUInteger bl = (*cb).length;
+                 int code = bl >= 2 && dir == 1 ? b[0] << 8 | b[1] : -1;
+                 NSString *why = bl > 2 && dir == 1 ? [[NSString alloc] initWithBytes:b + 2 length:bl - 2 encoding:NSUTF8StringEncoding] : nil;
+-                LOG("[nextendo] bridge: %s sends a WebSocket close (code %d%s%s)", dir ? "the server" : "the game", code, why.length ? ", " : "", why.UTF8String ?: "");
++                NXLOGA("bridge: %s sends a WebSocket close (code %d%s%s)", dir ? "the server" : "the game", code, why.length ? ", " : "", why.UTF8String ?: "");
+                 *cb = nil;
+             }
+             continue;
+@@ -894,7 +904,7 @@ static int nex_note(const uint8_t *b, unsigned n, uint64_t total, int dir, int *
+         w->op = op; w->masked = masked; w->len = len; w->pos = 0; w->capn = 0;
+         if (masked) memcpy(w->mask, w->h + need - 4, 4);
+         w->skip = len; w->have = 0;
+-        if (!len && *cb) { LOG("[nextendo] bridge: the server sends a WebSocket close (no code)"); *cb = nil; }
++        if (!len && *cb) { NXLOGA("bridge: the server sends a WebSocket close (no code)"); *cb = nil; }
+     }
+ }
+ - (void)logHead:(NSData *)head who:(const char *)who {   // the request or status line and the header names (values only of the harmless ones)
+@@ -905,7 +915,7 @@ static int nex_note(const uint8_t *b, unsigned n, uint64_t total, int dir, int *
+         NSRange c = [ln rangeOfString:@":"];
+         NSString *k = c.location == NSNotFound ? nil : [ln substringToIndex:c.location].lowercaseString;
+         BOOL show = !k || [@[@"host", @"upgrade", @"connection", @"sec-websocket-protocol", @"sec-websocket-version", @"server", @"content-type", @"content-length"] containsObject:k];
+-        LOG("[nextendo] bridge: %s: %s", who, (show ? ln : [k stringByAppendingString:@": …"]).UTF8String);
++        NXLOGA("bridge: %s: %s", who, (show ? ln : [k stringByAppendingString:@": …"]).UTF8String);
+     }
+ }
+ - (void)close {
+@@ -1033,7 +1043,7 @@ static int bridge_open_(const char *sni, int rewrite_host, uint16_t port) {
+         sec_protocol_options_set_verify_block(so, ^(sec_protocol_metadata_t md, sec_trust_t trust, sec_protocol_verify_complete_t complete) {
+             (void)md;
+             int ok = trust_matches_pin(trust, server_name.UTF8String);
+-            if (!ok) LOG("[nextendo] not connecting to %s: its key is not pinned (DM_NEXTENDO_PIN)", server_name.UTF8String);
++            if (!ok) NXLOGA("not connecting to %s: its key is not pinned (DM_NEXTENDO_PIN)", server_name.UTF8String);
+             complete(ok);
+         }, b->q);
+     }, ^(nw_protocol_options_t tcp) { nw_tcp_options_set_no_delay(tcp, true); });
+@@ -1052,10 +1062,10 @@ static int bridge_open_(const char *sni, int rewrite_host, uint16_t port) {
+             NXLOG("bridge: waiting for a route to the game server");
+             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 10 * NSEC_PER_SEC), s->q, ^{
+                 NxBridge *s2 = wb;
+-                if (s2 && !s2->ready && !s2->closed) { LOG("[nextendo] cannot reach the game server (no route for 10 s)"); [s2 close]; }
++                if (s2 && !s2->ready && !s2->closed) { NXLOGA("cannot reach the game server (no route for 10 s)"); [s2 close]; }
+             });
+         } else if (st == nw_connection_state_failed) {
+-            LOG("[nextendo] cannot reach the game server (error)");
++            NXLOGA("cannot reach the game server (error)");
+             [s close];
+         } else if (st == nw_connection_state_cancelled) {
+             @synchronized (NxBridge.class) { [g_bridges removeObject:s]; }
+diff --git a/dm/host/net_online.h b/dm/host/net_online.h
+index 13c32cf..3b6f193 100644
+--- a/dm/host/net_online.h
++++ b/dm/host/net_online.h
+@@ -47,7 +47,12 @@
+ 
+ int dm_net_online(void);              // DM_NEXTENDO=1 and the running game is supported; read once
+ int nx_log_on(void);
+-#define NXLOG(...) do { if (nx_log_on()) LOG("[nextendo] " __VA_ARGS__); } while (0)
++// Milliseconds since this run's first Nextendo line. Every line below carries one so a trace can be laid beside the emulator's, whose own log is
++// stamped to the millisecond: the two agree on every call made and every number returned, and what is left to compare is when each one happened
++double nx_log_ms(void);
++#define NXLOG(f, ...) do { if (nx_log_on()) LOG("[nextendo] %9.3f " f, nx_log_ms(), ##__VA_ARGS__); } while (0)
++// The lines that are logged whether or not the socket trace is on
++#define NXLOGA(f, ...) LOG("[nextendo] %9.3f " f, nx_log_ms(), ##__VA_ARGS__)
+ 
+ // The running game's NEX game server name (the SNI and Host of the bridge) and its version text for the ID token
+ const char *nx_game_host(void);
