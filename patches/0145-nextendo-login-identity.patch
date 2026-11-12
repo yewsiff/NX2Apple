@@ -1,0 +1,136 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: yewsifofficial <yewsifofficial@gmail.com>
+Date: Thu, 12 Nov 2026 02:09:06 -0500
+Subject: [PATCH] nex: say whether the login proves which account we are
+
+The one handoff that tells the server who is playing has never been seen on
+the wire. The game collects its BaaS ID token from
+nn::account::LoadNetworkServiceAccountIdTokenCache and forwards it inside its
+NEX login's extra data; the signed Nextendo token rides there in a custom
+"nnex" claim, and the server reads that claim, validates its HMAC and
+refuses any PID the claim does not prove (nextendo-nex, authbinding.go
+NexTokenFromLoginExtraData; ryujinx-nextendo, ManagerServer with the PID as
+the NetworkServiceAccountId the game logs in with). We build the token with
+the claim and answer that call with our PID, but nothing has ever confirmed
+either reaches the server, and a login the server cannot tie to an account
+looks exactly like a working session until a match is asked for.
+
+So both ends of the handoff now say what happened. The account hook logs
+every ID token the game collects, with the size of the buffer it offered,
+and logs plainly when it got none. The NEX trace decodes the login the way
+the server decodes it: the username it carries, whether that is our Nextendo
+PID, and whether its ID token holds the nnex claim.
+
+The decoder is the server's own algorithm -- scan for a JWT, take its
+payload segment, base64url-decode it, read the claim -- and it was checked
+against the server's own test vectors (bound, no claim, no token) plus a
+wrong-PID login, and over 811 truncated and corrupted logins under valgrind
+without an out-of-bounds read.
+
+Upstream-Status: fork-only (online play is out of nxnative's scope)
+Reason: Nextendo online play for Super Smash Bros. Ultimate
+Issue: yewsiff/NX2Apple (no tracker: issues are disabled on this fork)
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_017xdHQoEipBX2wTqN8BNnMv
+---
+ dm/host/hle_account.c        | 11 +++++++-
+ dm/host/net_nextendo_apple.m | 52 ++++++++++++++++++++++++++++++++++++
+ 2 files changed, 62 insertions(+), 1 deletion(-)
+
+diff --git a/dm/host/hle_account.c b/dm/host/hle_account.c
+index 9dcf560..09a0f48 100644
+--- a/dm/host/hle_account.c
++++ b/dm/host/hle_account.c
+@@ -68,12 +68,21 @@ HLE_FORCE("_ZN2nn7account26GetNetworkServiceAccountIdEPNS0_23NetworkServiceAccou
+     if (!pid) return RES_FAIL;
+     memcpy(id, &pid, 8); return RES_OK;
+ }
++// The game collects its BaaS ID token here and forwards it inside its NEX login, where the server reads the signed Nextendo token out of the
++// "nnex" claim: this is the one handoff that tells the server which account is playing. It is logged because a silent failure here looks
++// exactly like a working session until a match is asked for -- a buffer too small for the token, or an account not signed in yet, and the
++// game logs in with nothing to prove its PID
+ HLE_FORCE("_ZN2nn7account37LoadNetworkServiceAccountIdTokenCacheEPmPcmRKNS0_10UserHandleE", "network service account token, out of scope; cut", Result, h_acc_LoadTok, uint64_t *n, char *buf, uint64_t sz, const UserHandle *h) {
+     (void)h;
+     if (dm_net_online() && buf && sz) {
+         size_t len = nx_id_token(buf, sz);
+-        if (len) { if (n) *n = len; return RES_OK; }
++        if (len) {
++            NXLOG("account: the game collected its ID token, %zu bytes into a buffer of %llu (it carries the signed Nextendo token the server identifies us by)", len, (unsigned long long)sz);
++            if (n) *n = len; return RES_OK;
++        }
+     }
++    NXLOG("account: the game asked for its ID token and got none%s (buffer %llu): its NEX login will carry nothing to prove which account we are",
++          dm_net_online() ? "" : " (not online)", (unsigned long long)sz);
+     if (n) *n = 0; return RES_FAIL;
+ }
+ HLE_FORCE("_ZN2nn7account40ShowLicenseRequirementsForNetworkServiceERKNS0_10UserHandleE", "online membership notice applet, out of scope; cut", Result, h_acc_ShowLic, const UserHandle *h) { (void)h; return RES_FAIL; }
+diff --git a/dm/host/net_nextendo_apple.m b/dm/host/net_nextendo_apple.m
+index b9c2c3d..60f28ee 100644
+--- a/dm/host/net_nextendo_apple.m
++++ b/dm/host/net_nextendo_apple.m
+@@ -749,6 +749,53 @@ static int nex_stations(const uint8_t *b, unsigned n, const char *what) {
+     return found;
+ }
+ // 1 when a line was written. b: the first n bytes of the frame's payload (unmasked), total: the payload's whole length. *split: a split message is passing
++// What the auth server reads out of a NEX login, read here the same way, so a log says whether it will find us rather than leaving it to be
++// guessed at. The login carries the account's PID as its username and the BaaS ID token in its extra data; the signed Nextendo token rides in
++// that token's "nnex" claim, and the server validates the claim's HMAC and refuses any PID the claim does not prove (nextendo-nex,
++// authbinding.go NexTokenFromLoginExtraData, and ryujinx-nextendo, ManagerServer::GenerateIdToken). A login with no claim is a login the server
++// cannot tie to an account: it may let the connection stand and still refuse to place us in a match
++static int jwt_byte(uint8_t c) { return c == '.' || c == '-' || c == '_' || (c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z'); }
++static NSData *jwt_payload(const uint8_t *b, unsigned n) {
++    for (unsigned i = 0; i + 3 <= n; i++) {
++        if (memcmp(b + i, "eyJ", 3)) continue;
++        unsigned j = i;
++        while (j < n && jwt_byte(b[j])) j++;
++        const uint8_t *seg = NULL; unsigned seglen = 0, dots = 0;
++        for (unsigned k = i; k <= j; k++) {
++            if (k == j || b[k] == '.') {
++                if (dots == 1) { seglen = (unsigned)(b + k - seg); break; }
++                dots++; seg = b + k + 1;
++            }
++        }
++        if (!seg || !seglen) continue;
++        NSMutableString *t = [NSMutableString stringWithString:[[NSString alloc] initWithBytes:seg length:seglen encoding:NSASCIIStringEncoding] ?: @""];
++        [t replaceOccurrencesOfString:@"-" withString:@"+" options:0 range:NSMakeRange(0, t.length)];
++        [t replaceOccurrencesOfString:@"_" withString:@"/" options:0 range:NSMakeRange(0, t.length)];
++        while (t.length % 4) [t appendString:@"="];
++        NSData *d = [[NSData alloc] initWithBase64EncodedString:t options:0];
++        if (d.length) return d;
++    }
++    return nil;
++}
++static void nex_login_note(const uint8_t *b, unsigned bl, unsigned method) {
++    char name[48] = "";
++    unsigned len = bl >= 2 ? (b[0] | (unsigned)b[1] << 8) : 0;   // a NEX String: its length, then the bytes with their terminator
++    if (len && 2u + len <= bl) {
++        unsigned k = len && b[2 + len - 1] == 0 ? len - 1 : len;
++        if (k >= sizeof name) k = sizeof name - 1;
++        memcpy(name, b + 2, k); name[k] = 0;
++        for (unsigned i = 0; i < k; i++) if (name[i] < 0x20 || name[i] >= 0x7f) name[i] = '.';
++    }
++    uint64_t pid = nx_pid();
++    char want[24]; snprintf(want, sizeof want, "%llu", (unsigned long long)pid);
++    NSData *payload = jwt_payload(b, bl);
++    const char *claim = payload.length ? strstr([[NSString alloc] initWithData:payload encoding:NSUTF8StringEncoding].UTF8String ?: "", "\"nnex\"") : NULL;
++    LOG("[nextendo] NEX: the login names us %s%s; its ID token %s%s", name[0] ? name : "(no name)",
++        pid && !strcmp(name, want) ? " (our Nextendo PID, as it must be)" : pid ? " -- NOT our Nextendo PID, which the server will refuse" : "",
++        !payload.length ? "is MISSING, so the server cannot tie this login to an account" :
++        claim ? "carries the signed Nextendo token, which is what proves the PID" : "carries NO nnex claim, so the server cannot tie this login to an account",
++        method == 3 ? " (ValidateAndRequestTicket)" : method == 2 ? " (LoginEx)" : " (Login)");
++}
+ static int nex_note(const uint8_t *b, unsigned n, uint64_t total, int dir, int *split, int quiet) {
+     const char *who = dir ? "server → game" : "game → server";
+     if (n < 12 || b[0] != 0x80) return 0;
+@@ -778,6 +825,11 @@ static int nex_note(const uint8_t *b, unsigned n, uint64_t total, int dir, int *
+             LOG("[nextendo] NEX: the game reports a hole punch to another player: %s, round trip %u ms", body[4] ? "it worked" : "FAILED", le32(body + (method == 7 ? 9 : 5)));
+             return 1;
+         }
++        if (proto == 0x0a && (method == 1 || method == 2 || method == 3)) {   // the login: who the server is being told we are
++            NXLOG("NEX: %s call %u: %s %#x method %u (%llu bytes)", who, id, nex_protocol(proto), proto, method, (unsigned long long)total);
++            nex_login_note(body, bl, method);
++            return 1;
++        }
+         // Where the addresses for a hole punch are settled: the game's own stations at secure connection Register (1) and ReplaceURL (7), and
+         // the other player's at match making GetSessionURLs (0x15 method 41)
+         if ((proto == 0x0b && (method == 1 || method == 7)) || (proto == 0x15 && method == 41)) {

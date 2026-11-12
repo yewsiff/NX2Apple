@@ -31,6 +31,7 @@ call :one nextendo-ownaddr-for-v1.3.0 getifaddrs dm\host\net_nextendo_apple.m ||
 call :one nextendo-stations-for-v1.3.0 nex_stations dm\host\net_nextendo_apple.m || exit /b 1
 call :one nextendo-stationbytes-for-v1.3.0 differently dm\host\net_nextendo_apple.m || exit /b 1
 call :one nextendo-icmp-for-v1.3.0 sk_udp_icmp dm\host\hle_net.c || exit /b 1
+call :one nextendo-authbind-for-v1.3.0 nex_login_note dm\host\net_nextendo_apple.m || exit /b 1
 echo.
 echo All Nextendo patches are in. Rebuild the game in the launcher.
 exit /b 0
