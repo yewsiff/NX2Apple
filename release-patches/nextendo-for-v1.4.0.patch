@@ -237,7 +237,7 @@ index f38ca60..9e9c138 100644
  // The permission query answers as TryBegin / IsFreeCommunicationAvailable do: the SDK's version calls the pctl service (pctl::detail::ipc::GetService), which the host never opens (DRAGON QUEST XI S imports it; from PR #38)
  HLE_FORCE("_ZN2nn4pctl32CheckFreeCommunicationPermissionEb", "parental controls · permission to communicate with others, networking out of scope; never, no system UI", unsigned, h_pctl_CheckFree, unsigned show_ui) { (void)show_ui; return 0; }
 diff --git a/dm/host/hle_net.c b/dm/host/hle_net.c
-index aa82a2a..cbbe9b9 100644
+index aa82a2a..24c6bb6 100644
 --- a/dm/host/hle_net.c
 +++ b/dm/host/hle_net.c
 @@ -1,8 +1,20 @@
@@ -375,7 +375,7 @@ index aa82a2a..cbbe9b9 100644
      for (int k = 0; k < 3; k++) if (sets[k]) for (int fd = 0; fd < nfds; fd++) sets[k][fd >> 6] &= ~(1ull << (fd & 63));
      int n = 0;
      for (int i = 0; i < np; i++) {
-@@ -169,65 +212,788 @@ int dm_sk_select(int nfds, uint64_t *r, uint64_t *w, uint64_t *e, const int64_t
+@@ -169,65 +212,802 @@ int dm_sk_select(int nfds, uint64_t *r, uint64_t *w, uint64_t *e, const int64_t
      }
      return n;
  }
@@ -493,15 +493,29 @@ index aa82a2a..cbbe9b9 100644
 +// words, a probe {test id, -, -, local IP} and its reply {test id, the port and the address the server saw us from, the server's}
 +static void nat_note(const char *what, const void *b, long n, uint32_t ip_net, uint16_t port_net) {
 +    // The ports a Ryujinx-Nextendo trace of a working check shows: five 16-byte probes to 33334, which nothing answers and whose silence is the
-+    // filtering test, then ten to the game server on 10025 and five to the NAT check server on 10025, answered from both
++    // filtering test, then ten to the game server on 10025 and five to the NAT check server on 10025, answered from both. Last come three
++    // 76-byte ones to 33335, which nothing answers either -- Nextendo binds both ports and never replies on purpose (nextendo-nncs). Pia builds
++    // those three itself out of what it believes about its own station, and it abandons the session a fraction of a millisecond after the third,
++    // so their bytes are the nearest thing to Pia saying what it thinks it knows. They are printed whole
 +    uint16_t port = ntohs(port_net);
-+    if (!nx_log_on() || n != 16 || (port != 10025 && port != 10125 && port != 33334 && port != 33335)) return;
++    if (!nx_log_on() || (port != 10025 && port != 10125 && port != 33334 && port != 33335)) return;
 +    const uint8_t *p = b;
++    char d[24];
++    if (n == 76 && *what == 'p') {
++        char hex[3 * 76 + 1], asc[77];
++        for (long i = 0; i < n; i++) { snprintf(hex + 3 * i, 4, "%02x ", p[i]); asc[i] = p[i] >= 0x20 && p[i] < 0x7f ? (char)p[i] : '.'; }
++        hex[3 * n] = 0; asc[n] = 0;
++        NXLOG("NAT check: Pia's own 76-byte probe to %s, which goes unanswered by design: %s|%s", ip_str(ip_net, port_net, d), hex, asc);
++        return;
++    }
++    if (n != 16) return;
 +    uint32_t w[4];
 +    for (int i = 0; i < 4; i++) w[i] = (uint32_t)p[4 * i] << 24 | (uint32_t)p[4 * i + 1] << 16 | (uint32_t)p[4 * i + 2] << 8 | p[4 * i + 3];
-+    char d[24];
-+    if (*what == 'p') NXLOG("NAT check: probe %u to %s%s (our address in it %u.%u.%u.%u)", w[0], ip_str(ip_net, port_net, d), port == 33334 || port == 33335 ? ", which is meant to go unanswered" : "", w[3] >> 24, w[3] >> 16 & 255, w[3] >> 8 & 255, w[3] & 255);
-+    else NXLOG("NAT check: reply %u from %s: it saw us as %u.%u.%u.%u:%u", w[0], ip_str(ip_net, port_net, d), w[2] >> 24, w[2] >> 16 & 255, w[2] >> 8 & 255, w[2] & 255, w[1]);
++    // Only the first word is read by their responder, which echoes it; what the other three carry on the way out is Pia's business and is
++    // printed raw rather than named, an earlier guess at the third having sent this hunt down a blind alley
++    if (*what == 'p') NXLOG("NAT check: probe %u to %s%s (words %#x %#x %#x)", w[0], ip_str(ip_net, port_net, d), port == 33334 || port == 33335 ? ", which is meant to go unanswered" : "", w[1], w[2], w[3]);
++    else NXLOG("NAT check: reply %u from %s: it saw us as %u.%u.%u.%u:%u (responder %u.%u.%u.%u)", w[0], ip_str(ip_net, port_net, d),
++               w[2] >> 24, w[2] >> 16 & 255, w[2] >> 8 & 255, w[2] & 255, w[1], w[3] >> 24, w[3] >> 16 & 255, w[3] >> 8 & 255, w[3] & 255);
 +}
 +static int bridge_fd(int fd) { pthread_mutex_lock(&g_efd_m); int b = sk_used(fd) && g_efd[fd].bridge; pthread_mutex_unlock(&g_efd_m); return b; }
 +static int on_wait(int h, short events, int64_t ms) {
@@ -1200,7 +1214,7 @@ index aa82a2a..cbbe9b9 100644
  #define SSF(m, cname, ...) HLE_FORCE(m, "ssl service (cut): fails", Result, cname, __VA_ARGS__)
  HLE_FORCE("_ZN2nn3ssl10InitializeEv", "same as nnsslInitialize: succeeds, creates no session (cut)", Result, h_ssl_InitCpp, void) { return RES_OK; }
  HLE_FORCE("_ZN2nn3ssl8FinalizeEv", "pairs with Initialize (cut)", Result, h_ssl_FinCpp, void) { return RES_OK; }
-@@ -237,19 +1003,63 @@ SSF("_ZN2nn3ssl7Context19RegisterInternalPkiEPmNS1_11InternalPkiE", h_ssl_CtxReg
+@@ -237,19 +1017,63 @@ SSF("_ZN2nn3ssl7Context19RegisterInternalPkiEPmNS1_11InternalPkiE", h_ssl_CtxReg
  SSF("_ZN2nn3ssl7Context9RemovePkiEm", h_ssl_CtxRemovePki, void *self, uint64_t id) { (void)self; (void)id; return RES_FAIL; }
  SSF("_ZN2nn3ssl14BuiltInManager28GetBuiltInCertificateBufSizeEPjPNS0_15CaCertificateIdEj", h_ssl_BiBufSize, uint32_t *o, void *ids, unsigned n) { (void)ids; (void)n; if (o) *o = 0; return RES_FAIL; }
  SSF("_ZN2nn3ssl14BuiltInManager22GetBuiltInCertificatesEPPNS1_22BuiltInCertificateInfoEPhjPNS0_15CaCertificateIdEj", h_ssl_BiCerts, void **o, uint8_t *b, unsigned bs, void *ids, unsigned n) { (void)o; (void)b; (void)bs; (void)ids; (void)n; return RES_FAIL; }

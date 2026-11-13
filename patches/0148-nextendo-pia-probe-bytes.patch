@@ -1,0 +1,69 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: yewsifofficial <yewsifofficial@gmail.com>
+Date: Thu, 12 Nov 2026 18:59:38 -0500
+Subject: [PATCH] nextendo: print Pia's own NAT probe, and stop naming a field
+ nobody reads
+
+The three 76-byte datagrams Pia sends to the sinkhole on 33335 were never
+decoded: nat_note only handled the 16-byte ones. Pia builds those three out
+of what it believes about its own station, and it abandons the session 467
+microseconds after the third, so their bytes are the nearest thing to Pia
+saying what it thinks it knows -- above all whether it has learnt its own
+global address, which the station it registers suggests it has not. They are
+now printed whole, hex and text.
+
+The 16-byte probes had a field labelled "our address in it", which was a
+guess: their responder reads only the first word and echoes it, and that
+guess cost a round of this hunt chasing a zero that meant nothing. The three
+remaining words are printed raw and named as Pia's business. Replies now
+also name the responder that answered, which is the fourth word and the one
+part of the layout their source does confirm.
+
+Upstream-Status: fork-only (online play is out of nxnative's scope)
+Reason: Nextendo online play for Super Smash Bros. Ultimate
+Issue: yewsiff/NX2Apple (no tracker: issues are disabled on this fork)
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_017xdHQoEipBX2wTqN8BNnMv
+---
+ dm/host/hle_net.c | 24 +++++++++++++++++++-----
+ 1 file changed, 19 insertions(+), 5 deletions(-)
+
+diff --git a/dm/host/hle_net.c b/dm/host/hle_net.c
+index cbbe9b9..24c6bb6 100644
+--- a/dm/host/hle_net.c
++++ b/dm/host/hle_net.c
+@@ -315,15 +315,29 @@ static int sk_is_udp(int fd) { pthread_mutex_lock(&g_efd_m); int u = sk_used(fd)
+ // words, a probe {test id, -, -, local IP} and its reply {test id, the port and the address the server saw us from, the server's}
+ static void nat_note(const char *what, const void *b, long n, uint32_t ip_net, uint16_t port_net) {
+     // The ports a Ryujinx-Nextendo trace of a working check shows: five 16-byte probes to 33334, which nothing answers and whose silence is the
+-    // filtering test, then ten to the game server on 10025 and five to the NAT check server on 10025, answered from both
++    // filtering test, then ten to the game server on 10025 and five to the NAT check server on 10025, answered from both. Last come three
++    // 76-byte ones to 33335, which nothing answers either -- Nextendo binds both ports and never replies on purpose (nextendo-nncs). Pia builds
++    // those three itself out of what it believes about its own station, and it abandons the session a fraction of a millisecond after the third,
++    // so their bytes are the nearest thing to Pia saying what it thinks it knows. They are printed whole
+     uint16_t port = ntohs(port_net);
+-    if (!nx_log_on() || n != 16 || (port != 10025 && port != 10125 && port != 33334 && port != 33335)) return;
++    if (!nx_log_on() || (port != 10025 && port != 10125 && port != 33334 && port != 33335)) return;
+     const uint8_t *p = b;
++    char d[24];
++    if (n == 76 && *what == 'p') {
++        char hex[3 * 76 + 1], asc[77];
++        for (long i = 0; i < n; i++) { snprintf(hex + 3 * i, 4, "%02x ", p[i]); asc[i] = p[i] >= 0x20 && p[i] < 0x7f ? (char)p[i] : '.'; }
++        hex[3 * n] = 0; asc[n] = 0;
++        NXLOG("NAT check: Pia's own 76-byte probe to %s, which goes unanswered by design: %s|%s", ip_str(ip_net, port_net, d), hex, asc);
++        return;
++    }
++    if (n != 16) return;
+     uint32_t w[4];
+     for (int i = 0; i < 4; i++) w[i] = (uint32_t)p[4 * i] << 24 | (uint32_t)p[4 * i + 1] << 16 | (uint32_t)p[4 * i + 2] << 8 | p[4 * i + 3];
+-    char d[24];
+-    if (*what == 'p') NXLOG("NAT check: probe %u to %s%s (our address in it %u.%u.%u.%u)", w[0], ip_str(ip_net, port_net, d), port == 33334 || port == 33335 ? ", which is meant to go unanswered" : "", w[3] >> 24, w[3] >> 16 & 255, w[3] >> 8 & 255, w[3] & 255);
+-    else NXLOG("NAT check: reply %u from %s: it saw us as %u.%u.%u.%u:%u", w[0], ip_str(ip_net, port_net, d), w[2] >> 24, w[2] >> 16 & 255, w[2] >> 8 & 255, w[2] & 255, w[1]);
++    // Only the first word is read by their responder, which echoes it; what the other three carry on the way out is Pia's business and is
++    // printed raw rather than named, an earlier guess at the third having sent this hunt down a blind alley
++    if (*what == 'p') NXLOG("NAT check: probe %u to %s%s (words %#x %#x %#x)", w[0], ip_str(ip_net, port_net, d), port == 33334 || port == 33335 ? ", which is meant to go unanswered" : "", w[1], w[2], w[3]);
++    else NXLOG("NAT check: reply %u from %s: it saw us as %u.%u.%u.%u:%u (responder %u.%u.%u.%u)", w[0], ip_str(ip_net, port_net, d),
++               w[2] >> 24, w[2] >> 16 & 255, w[2] >> 8 & 255, w[2] & 255, w[1], w[3] >> 24, w[3] >> 16 & 255, w[3] >> 8 & 255, w[3] & 255);
+ }
+ static int bridge_fd(int fd) { pthread_mutex_lock(&g_efd_m); int b = sk_used(fd) && g_efd[fd].bridge; pthread_mutex_unlock(&g_efd_m); return b; }
+ static int on_wait(int h, short events, int64_t ms) {

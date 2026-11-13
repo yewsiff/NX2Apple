@@ -110,3 +110,4 @@
 0145-nextendo-login-identity.patch
 0146-nextendo-log-time-and-login.patch
 0147-nextendo-giveup-backtrace.patch
+0148-nextendo-pia-probe-bytes.patch
